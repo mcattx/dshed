@@ -65,15 +65,24 @@ function httpPost(port, pathname, headers = {}, body = '') {
   })
 }
 
-function portReleased(port) {
-  return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: 2000 }, () => {
-      req.destroy()
-      resolve(false)
+function portReleased(port, timeoutMs = 5000) {
+  // poll until the port stops accepting connections; Windows releases socket
+  // handles slower than macOS after a process stop
+  const deadline = Date.now() + timeoutMs
+  return (async function poll() {
+    const released = await new Promise((resolve) => {
+      const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: 800 }, () => {
+        req.destroy()
+        resolve(false)
+      })
+      req.on('error', () => resolve(true))
+      req.on('timeout', () => { req.destroy(); resolve(false) })
     })
-    req.on('error', () => resolve(true))
-    req.on('timeout', () => { req.destroy(); resolve(false) })
-  })
+    if (released) return true
+    if (Date.now() >= deadline) return false
+    await new Promise((r) => setTimeout(r, 300))
+    return poll()
+  })()
 }
 
 function wsUpgrade(port, pathname, headers) {

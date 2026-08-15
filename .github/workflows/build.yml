@@ -2,6 +2,11 @@ name: Build
 
 on:
   workflow_dispatch:          # manual: build artifacts only (no release)
+    inputs:
+      platforms:              # comma-separated subset, e.g. win-x64,mac-arm64; empty = all
+        description: 'Platforms to build (mac-arm64,mac-x64,win-x64,linux-x64,linux-arm64). Empty builds all.'
+        required: false
+        default: ''
   push:
     tags: ['v*']              # tag push: build + publish GitHub Release
 
@@ -16,27 +21,37 @@ jobs:
       matrix:
         include:
           # macOS arm64 —— 主架构，发布自动更新元数据
-          - os: macos-latest
+          - id: mac-arm64
+            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'mac-arm64') }}
+            os: macos-latest
             prepare: darwin-arm64
             build: --mac --arm64
             publish: always
           # macOS x64 —— Rosetta 交叉（runner 是 arm64），只出产物，不发布（避免覆盖 latest-mac.yml）
-          - os: macos-latest
+          - id: mac-x64
+            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'mac-x64') }}
+            os: macos-latest
             prepare: darwin-x64
             build: --mac --x64
             publish: never
           # Linux x64 —— 主架构
-          - os: ubuntu-latest
+          - id: linux-x64
+            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'linux-x64') }}
+            os: ubuntu-latest
             prepare: linux-x64
             build: --linux --x64
             publish: always
           # Linux arm64（GitHub arm64 runner）
-          - os: ubuntu-24.04-arm
+          - id: linux-arm64
+            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'linux-arm64') }}
+            os: ubuntu-24.04-arm
             prepare: linux-arm64
             build: --linux --arm64
             publish: always
           # Windows x64
-          - os: windows-latest
+          - id: win-x64
+            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'win-x64') }}
+            os: windows-latest
             prepare: win32-x64
             build: --win --x64
             publish: always

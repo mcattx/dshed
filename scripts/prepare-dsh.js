@@ -104,7 +104,16 @@ async function prepareNode() {
   fs.rmSync(tmp, { recursive: true, force: true })
   fs.mkdirSync(tmp, { recursive: true })
   log(`extracting ${tarball}`)
-  execFileSync('tar', ['-xf', tarball, '-C', tmp], { stdio: 'inherit' })
+  if (targetPlatform() === 'win32') {
+    // Windows bsdtar parses "D:\..." as a URL scheme; PowerShell
+    // Expand-Archive handles zip reliably.
+    execFileSync('powershell', [
+      '-NoProfile', '-Command',
+      `Expand-Archive -Force -LiteralPath '${tarball}' -DestinationPath '${tmp}'`,
+    ], { stdio: 'inherit' })
+  } else {
+    execFileSync('tar', ['-xf', tarball, '-C', tmp], { stdio: 'inherit' })
+  }
 
   // flatten node-v22.23.2-xxx/* → resources/node/
   const entries = fs.readdirSync(tmp)

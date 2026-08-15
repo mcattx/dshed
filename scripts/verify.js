@@ -177,10 +177,13 @@ async function main() {
     })
   })
   ok(engine.port !== portA, `port changed after restart (${portA} → ${engine.port})`)
-  windowsPortOwner(engine.port)
+  // save the restarted port: engine.stop() clears engine.port (exit handler),
+  // and probing null would fall back to port 80
+  const portB = engine.port
+  windowsPortOwner(portB)
   await engine.stop()
-  windowsPortOwner(engine.port)
-  ok(await portReleased(engine.port), 'port released after restart')
+  windowsPortOwner(portB)
+  ok(await portReleased(portB), 'port released after restart')
 
   console.log(`\n=== result: ${passed} passed, ${failed} failed ===`)
   process.exit(failed ? 1 : 0)

@@ -69,9 +69,23 @@ function migrateLegacyDsh({ dshHome, home = process.env.HOME, logger }) {
     log.info('[dshed] engine data already exists, skipping ~/.dsh migration')
     return
   }
-  copyMissing(legacy, dshHome)
+  // Whitelist copy: user data only. profiles/ is an engine-version-bound plugin
+  // layer — copying a stale one breaks engine startup (observed on Windows).
+  const USER_DATA_DIRS = ['sessions', 'storages']
+  const USER_DATA_FILES = ['settings.yaml', '.credentials.yaml', '.anonymous-user-id']
+  for (const dir of USER_DATA_DIRS) {
+    const src = path.join(legacy, dir)
+    if (fs.existsSync(src)) {
+      fs.mkdirSync(path.join(dshHome, dir), { recursive: true })
+      copyMissing(src, path.join(dshHome, dir))
+    }
+  }
+  for (const file of USER_DATA_FILES) {
+    const src = path.join(legacy, file)
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dshHome, file))
+  }
   fs.writeFileSync(marker, `migrated from ${legacy} at ${new Date().toISOString()}\n`)
-  log.info(`[dshed] merged legacy dsh data from ${legacy} into ${dshHome}`)
+  log.info(`[dshed] merged legacy user data from ${legacy} into ${dshHome}`)
 }
 
 /**
@@ -79,29 +93,6 @@ function migrateLegacyDsh({ dshHome, home = process.env.HOME, logger }) {
  * Copies the engine data dir (dsh) when the new location is empty.
  * @param {object} opts { userData, legacyUserData, logger }
  */
-function migrateLegacyUserData({ userData, legacyUserData, logger }) {
-  const log = logger || { info: () => {}, warn: () => {} }
-  if (!legacyUserData || legacyUserData === userData) return
-  if (!fs.existsSync(legacyUserData)) return
-
-  const legacyDsh = path.join(legacyUserData, 'dsh')
-  const newDsh = path.join(userData, 'dsh')
-  if (!fs.existsSync(legacyDsh)) return
-  if (dirHasContent(newDsh)) {
-    log.info('[dshed] new engine data already exists, skipping legacy userData migration')
-    return
-  }
-  try {
-    fs.mkdirSync(newDsh, { recursive: true, mode: 0o700 })
-    copyMissing(legacyDsh, newDsh)
-    log.info(`[dshed] migrated engine data from legacy userData ${legacyUserData}`)
-  } catch (err) {
-    // a failed migration must never block startup
-    log.warn(`[dshed] legacy userData migration failed (continuing): ${err.message}`)
-    try { fs.rmSync(newDsh, { recursive: true, force: true }) } catch (e) { /* ignore */ }
-  }
-}
-
 /** Read the state file */
 function readState(userData) {
   try {
@@ -133,4 +124,4 @@ function recordVersion({ userData, version, logger, onUpgrade }) {
   return { upgraded: !!prevVersion && prevVersion !== version, prevVersion, version }
 }
 
-module.exports = { migrateLegacyDsh, migrateLegacyUserData, recordVersion, copyMissing }
+module.exports = { migrateLegacyDsh, recordVersion, copyMissing }

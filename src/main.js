@@ -9,7 +9,7 @@ const path = require('node:path')
 const fs = require('node:fs')
 const { EngineManager } = require('./engine-manager')
 const { AuthProxy } = require('./auth-proxy')
-const { migrateLegacyDsh, migrateLegacyUserData, recordVersion } = require('./migration')
+const { migrateLegacyDsh, recordVersion } = require('./migration')
 const { initUpdater } = require('./updater')
 const { t, pageLang } = require('./i18n')
 
@@ -95,10 +95,7 @@ async function bootstrap() {
 
   const userData = app.getPath('userData')
   const dshHome = path.join(userData, 'dsh')
-  // brand rename (harbor-desktop → dshed): carry over engine data from the old userData
-  const legacyUserData = path.join(app.getPath('appData'), 'harbor-desktop')
-  migrateLegacyUserData({ userData, legacyUserData, logger })
-  // first run: merge legacy dsh CLI data (~/.dsh); version upgrade hook
+  // first run: merge legacy dsh CLI user data (~/.dsh); version upgrade hook
   migrateLegacyDsh({ dshHome, logger })
   recordVersion({
     userData,

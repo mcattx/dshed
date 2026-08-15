@@ -75,11 +75,16 @@ jobs:
       - name: Smoke test
         run: npm test
 
-      # 构建：仅 tag 推送（v*）时发布到 GitHub Release；手动触发只出 Artifact
-      - name: Build
+      # 构建。发布仅限：tag 推送（v*）且该矩阵项标记 publish=always（mac-x64 永不上传，
+      # 避免覆盖 latest-mac.yml 导致 arm64 自动更新失效）。手动触发只出 Artifact。
+      - name: Build (publish)
+        if: matrix.publish == 'always' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder ${{ matrix.build }} --publish ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') ? 'always' : 'never' }}
+        run: npx electron-builder ${{ matrix.build }} --publish always
+      - name: Build (artifact only)
+        if: matrix.publish != 'always' || github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
+        run: npx electron-builder ${{ matrix.build }} --publish never
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -6,16 +6,43 @@
 
 const { app, BrowserWindow, session, shell, Tray, Menu, nativeImage } = require('electron')
 const path = require('node:path')
+const fs = require('node:fs')
 const { EngineManager } = require('./engine-manager')
 const { AuthProxy } = require('./auth-proxy')
 const { migrateLegacyDsh, migrateLegacyUserData, recordVersion } = require('./migration')
 const { initUpdater } = require('./updater')
 const { t, pageLang } = require('./i18n')
 
+// —— 文件日志：打包版双击启动无终端，stdout/stderr 会丢失；落盘到
+// userData/logs/main.log（mac: ~/Library/Application Support/dshed/logs，
+// win: %APPDATA%/dshed/logs），启动早期（app ready 前）用临时目录兜底。
+let logFile = null
+let bootLog = []
+function writeLog(level, args) {
+  const line = `[${new Date().toISOString()}] [${level}] ${args.join(' ')}`
+  if (logFile) {
+    try { fs.appendFileSync(logFile, line + '\n') } catch (e) { /* ignore */ }
+  } else {
+    bootLog.push(line)
+    if (bootLog.length > 200) bootLog.shift()
+  }
+}
+function initLogFile() {
+  try {
+    const dir = path.join(app.getPath('userData'), 'logs')
+    fs.mkdirSync(dir, { recursive: true })
+    logFile = path.join(dir, 'main.log')
+    if (bootLog.length) {
+      fs.appendFileSync(logFile, bootLog.join('\n') + '\n')
+      bootLog = []
+    }
+    console.log('[dshed] log file:', logFile)
+  } catch (e) { /* ignore */ }
+}
 const logger = {
-  info: (...a) => console.log('[dshed]', ...a),
-  warn: (...a) => console.warn('[dshed]', ...a),
-  error: (...a) => console.error('[dshed]', ...a),
+  info: (...a) => { console.log('[dshed]', ...a); writeLog('info', a) },
+  warn: (...a) => { console.warn('[dshed]', ...a); writeLog('warn', a) },
+  error: (...a) => { console.error('[dshed]', ...a); writeLog('error', a) },
 }
 
 let engine = null
@@ -42,6 +69,13 @@ if (!gotLock) {
     shutdown().finally(() => app.quit())
   })
 
+  process.on('uncaughtException', (err) => {
+    writeLog('error', ['uncaughtException:', err && err.stack ? err.stack : String(err)])
+  })
+  process.on('unhandledRejection', (reason) => {
+    writeLog('error', ['unhandledRejection:', String(reason)])
+  })
+
   app.whenReady().then(bootstrap).catch((err) => {
     logger.error('startup failed:', err)
     showFatalError(err)
@@ -49,6 +83,7 @@ if (!gotLock) {
 }
 
 async function bootstrap() {
+  initLogFile()
   // macOS: in dev (unpackaged) mode the Dock icon defaults to Electron's;
   // override with the dshed logo. Packaged builds get the icns from
   // electron-builder, so this is dev-only.

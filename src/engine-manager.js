@@ -19,7 +19,9 @@ const http = require('node:http')
 
 // stable dsh stdout protocol (verified P3): `dsh web: http://127.0.0.1:<port>`
 const PORT_RE = /dsh web:\s+http:\/\/127\.0\.0\.1:(\d+)/
-const STARTUP_TIMEOUT_MS = 30000
+// Windows first run can be slow (Defender scans unsigned node.exe + engine
+// initializes workers/sandbox); 30s was too tight and killed a healthy engine.
+const STARTUP_TIMEOUT_MS = 120000
 const HEALTH_TIMEOUT_MS = 2000
 const GRACEFUL_TIMEOUT_MS = 3000
 const MAX_CONSECUTIVE_CRASHES = 5

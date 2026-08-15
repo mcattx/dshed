@@ -139,8 +139,10 @@ async function prepareDsh() {
   const bundledNode = isWin
     ? path.join(RESOURCES, 'node', 'node.exe')
     : path.join(RESOURCES, 'node', 'bin', 'node')
+  // Windows: npm.cmd is a batch file that cannot run under node.exe; invoke
+  // npm-cli.js directly instead. Unix: npm shell script is fine via node.
   const npmCli = isWin
-    ? path.join(RESOURCES, 'node', 'npm.cmd')
+    ? path.join(RESOURCES, 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js')
     : path.join(RESOURCES, 'node', 'bin', 'npm')
   const env = { ...process.env, npm_config_progress: 'false' }
   // install scripts (e.g. koffi's `sh -c node cnoke.cjs`) resolve node from PATH;

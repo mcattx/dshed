@@ -3,114 +3,70 @@ name: Build
 on:
   workflow_dispatch:          # manual: build artifacts only (no release)
     inputs:
-      platforms:              # comma-separated subset, e.g. win-x64,mac-arm64; empty = all
+      platforms:              # comma-separated subset; empty = all
         description: 'Platforms to build (mac-arm64,mac-x64,win-x64,linux-x64,linux-arm64). Empty builds all.'
         required: false
         default: ''
   push:
     tags: ['v*']              # tag push: build + publish GitHub Release
 
-# 只读源码 + 写 Release（发布时用）
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # macOS arm64 —— 主架构，发布自动更新元数据
-          - id: mac-arm64
-            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'mac-arm64') }}
-            os: macos-latest
-            prepare: darwin-arm64
-            build: --mac --arm64
-            publish: always
-          # macOS x64 —— Rosetta 交叉（runner 是 arm64），只出产物，不发布（避免覆盖 latest-mac.yml）
-          - id: mac-x64
-            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'mac-x64') }}
-            os: macos-latest
-            prepare: darwin-x64
-            build: --mac --x64
-            publish: never
-          # Linux x64 —— 主架构
-          - id: linux-x64
-            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'linux-x64') }}
-            os: ubuntu-latest
-            prepare: linux-x64
-            build: --linux --x64
-            publish: always
-          # Linux arm64（GitHub arm64 runner）
-          - id: linux-arm64
-            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'linux-arm64') }}
-            os: ubuntu-24.04-arm
-            prepare: linux-arm64
-            build: --linux --arm64
-            publish: always
-          # Windows x64
-          - id: win-x64
-            if: ${{ inputs.platforms == '' || contains(inputs.platforms, 'win-x64') }}
-            os: windows-latest
-            prepare: win32-x64
-            build: --win --x64
-            publish: always
-
-    runs-on: ${{ matrix.os }}
-
-    env:
-      HARBOR_TARGET_ARCH: ${{ matrix.prepare }}
-
+  mac-arm64:
+    # 主架构，tag 发布时上传（写 latest-mac.yml）
+    if: ${{ !inputs.platforms || contains(inputs.platforms, 'mac-arm64') }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: ./.github/actions/build-platform
         with:
-          node-version: 22
-          cache: npm
+          prepare: darwin-arm64
+          build: --mac --arm64
+          publish: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'always' || 'never' }}
 
-      - name: Install deps
-        run: npm ci
-
-      # 缓存 dsh 引擎 + Node 运行时（按架构分 key，命中后 prepare 秒级完成）
-      - name: Cache engine resources
-        uses: actions/cache@v4
+  mac-x64:
+    # Rosetta 交叉；只出产物，永不上传（避免覆盖 latest-mac.yml）
+    if: ${{ !inputs.platforms || contains(inputs.platforms, 'mac-x64') }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-platform
         with:
-          path: |
-            resources/cache
-            resources/node
-            resources/dsh
-          key: resources-${{ matrix.prepare }}-${{ hashFiles('package.json', 'scripts/prepare-dsh.js') }}
-          restore-keys: |
-            resources-${{ matrix.prepare }}-
+          prepare: darwin-x64
+          build: --mac --x64
+          publish: never
 
-      - name: Prepare engine resources
-        run: node scripts/prepare-dsh.js
-
-      - name: Smoke test
-        run: npm test
-
-      # 构建。发布仅限：tag 推送（v*）且该矩阵项标记 publish=always（mac-x64 永不上传，
-      # 避免覆盖 latest-mac.yml 导致 arm64 自动更新失效）。手动触发只出 Artifact。
-      - name: Build (publish)
-        if: matrix.publish == 'always' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder ${{ matrix.build }} --publish always
-      - name: Build (artifact only)
-        if: matrix.publish != 'always' || github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
-        run: npx electron-builder ${{ matrix.build }} --publish never
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+  linux-x64:
+    if: ${{ !inputs.platforms || contains(inputs.platforms, 'linux-x64') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-platform
         with:
-          name: dshed-${{ matrix.prepare }}
-          path: |
-            dist/*.dmg
-            dist/*.zip
-            dist/*.exe
-            dist/*.AppImage
-            dist/*.deb
-            dist/*.blockmap
-            dist/latest*.yml
-          if-no-files-found: error
+          prepare: linux-x64
+          build: --linux --x64
+          publish: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'always' || 'never' }}
+
+  linux-arm64:
+    if: ${{ !inputs.platforms || contains(inputs.platforms, 'linux-arm64') }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-platform
+        with:
+          prepare: linux-arm64
+          build: --linux --arm64
+          publish: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'always' || 'never' }}
+
+  win-x64:
+    if: ${{ !inputs.platforms || contains(inputs.platforms, 'win-x64') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-platform
+        with:
+          prepare: win32-x64
+          build: --win --x64
+          publish: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && 'always' || 'never' }}

@@ -1,0 +1,67 @@
+name: Build dshed platform
+description: Prepare engine resources, smoke test, build and upload artifacts for one platform.
+
+inputs:
+  prepare:
+    description: HARBOR_TARGET_ARCH for resource preparation
+    required: true
+  build:
+    description: electron-builder flags (e.g. --win --x64)
+    required: true
+  publish:
+    description: electron-builder --publish value (always/never)
+    required: false
+    default: never
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+
+    - name: Install deps
+      run: npm ci
+      shell: bash
+
+    - name: Cache engine resources
+      uses: actions/cache@v4
+      with:
+        path: |
+          resources/cache
+          resources/node
+          resources/dsh
+        key: resources-${{ inputs.prepare }}-${{ hashFiles('package.json', 'scripts/prepare-dsh.js') }}
+        restore-keys: |
+          resources-${{ inputs.prepare }}-
+
+    - name: Prepare engine resources
+      run: node scripts/prepare-dsh.js
+      shell: bash
+      env:
+        HARBOR_TARGET_ARCH: ${{ inputs.prepare }}
+
+    - name: Smoke test
+      run: npm test
+      shell: bash
+
+    - name: Build
+      run: npx electron-builder ${{ inputs.build }} --publish ${{ inputs.publish }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: dshed-${{ inputs.prepare }}
+        path: |
+          dist/*.dmg
+          dist/*.zip
+          dist/*.exe
+          dist/*.AppImage
+          dist/*.deb
+          dist/*.blockmap
+          dist/latest*.yml
+        if-no-files-found: error

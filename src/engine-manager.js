@@ -203,11 +203,13 @@ class EngineManager extends EventEmitter {
 
     this.logger.info(`[engine] stopping: SIGTERM pid=${pid}`)
     const exited = new Promise((resolve) => child.once('exit', resolve))
+
     if (process.platform === 'win32') {
       // Windows: SIGTERM is a hard TerminateProcess anyway and does not give
       // the engine a chance to clean up its child processes (workers/sandbox);
-      // kill the whole tree so no orphan holds the port.
-      this._killTree(pid)
+      // kill the whole tree and WAIT for taskkill to finish — main-process exit
+      // alone does not mean every descendant is gone.
+      await this._killTree(pid).catch((e) => this.logger.warn(`[engine] taskkill failed: ${e.message}`))
     } else {
       child.kill('SIGTERM')
     }
@@ -219,35 +221,58 @@ class EngineManager extends EventEmitter {
 
     if (graceful === 'timeout') {
       this.logger.warn('[engine] SIGTERM timed out, force-killing process tree')
-      this._killTree(pid)
-      await exited
+      await this._killTree(pid).catch(() => {})
+      await exited.catch(() => {})
     }
 
-    if (port) await this._verifyPortReleased(port)
+    if (port) await this._waitForPortReleased(port, 15000)
     this.emit('stopped')
     this.logger.info('[engine] stopped')
   }
 
-  /** Force-kill process tree: win taskkill /T /F; unix kill process group */
+  /**
+   * Force-kill the process tree. Returns a Promise that resolves when the
+   * kill command itself has completed (not merely been spawned).
+   * Windows: taskkill /T /F; Unix: kill the process group.
+   */
   _killTree(pid) {
-    if (process.platform === 'win32') {
-      try { spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }) } catch (e) { /* ignore */ }
-    } else {
+    if (process.platform !== 'win32') {
       try { process.kill(-pid, 'SIGKILL') } catch (e) {
         try { process.kill(pid, 'SIGKILL') } catch (e2) { /* ignore */ }
       }
+      return Promise.resolve()
     }
+    return new Promise((resolve, reject) => {
+      let stderr = ''
+      let killer
+      try {
+        killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (e) { return reject(e) }
+      killer.stderr.on('data', (c) => { stderr += c.toString() })
+      killer.once('error', reject)
+      killer.once('close', (code) => {
+        // 128 = target process already gone; treat as success
+        if (code === 0 || code === 128) resolve()
+        else reject(new Error(`taskkill exit ${code}: ${stderr.trim()}`))
+      })
+    })
   }
 
-  /** Verify the port was released (no leftover listeners) */
-  _verifyPortReleased(port) {
-    return new Promise((resolve) => {
-      const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: 2000 }, () => {
-        req.destroy()
-        resolve(false)
-      })
-      req.on('error', () => resolve(true))
-      req.on('timeout', () => { req.destroy(); resolve(false) })
+  /** Poll until the port stops accepting connections; reject on timeout. */
+  _waitForPortReleased(port, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    return new Promise((resolve, reject) => {
+      const check = () => {
+        const req = http.get({ host: '127.0.0.1', port, path: '/', timeout: 800 }, (res) => {
+          res.resume()
+          req.destroy()
+          if (Date.now() >= deadline) return reject(new Error(`port ${port} still accepting connections`))
+          setTimeout(check, 250)
+        })
+        req.once('error', () => resolve())
+        req.once('timeout', () => { req.destroy(); if (Date.now() >= deadline) return reject(new Error(`port ${port} still accepting connections`)); setTimeout(check, 250) })
+      }
+      check()
     })
   }
 }

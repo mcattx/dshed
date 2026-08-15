@@ -18,6 +18,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { WebSocket } = require('ws')
 const { EngineManager } = require('../src/engine-manager')
+const { execFileSync } = require('node:child_process')
 const { AuthProxy } = require('../src/auth-proxy')
 
 let passed = 0
@@ -95,6 +96,19 @@ function wsUpgrade(port, pathname, headers) {
   })
 }
 
+function windowsPortOwner(port) {
+  if (process.platform !== 'win32') return
+  try {
+    const out = execFileSync('powershell.exe', [
+      '-NoProfile', '-Command',
+      `Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess`,
+    ], { encoding: 'utf8' })
+    console.log(`[win-probe] port ${port} owner pids: ${out.trim() || 'NONE'}`)
+  } catch (e) {
+    console.log(`[win-probe] port ${port} probe failed: ${e.message}`)
+  }
+}
+
 async function main() {
   const dshHome = path.join(os.tmpdir(), `dshed-verify-${Date.now()}`)
   console.log('=== M1 smoke verification ===')
@@ -163,7 +177,9 @@ async function main() {
     })
   })
   ok(engine.port !== portA, `port changed after restart (${portA} → ${engine.port})`)
+  windowsPortOwner(engine.port)
   await engine.stop()
+  windowsPortOwner(engine.port)
   ok(await portReleased(engine.port), 'port released after restart')
 
   console.log(`\n=== result: ${passed} passed, ${failed} failed ===`)

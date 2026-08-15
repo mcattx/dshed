@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 512 512"
+     role="img"
+     aria-labelledby="title desc">
+  <title id="title">dshed logo</title>
+  <desc id="desc">
+    A ring of colored light points forming the letter D inside a rounded square.
+  </desc>
+
+  <rect
+    x="28"
+    y="28"
+    width="456"
+    height="456"
+    rx="72"
+    fill="#151517"
+    stroke="#30475E"
+    stroke-width="18"
+  />
+
+  <path
+    d="M390 96h52v52"
+    fill="none"
+    stroke="#52D6FF"
+    stroke-width="22"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- D-shaped light points -->
+  <g transform="translate(16 24)">
+    <circle cx="126" cy="108" r="18" fill="#52D6FF"/>
+    <circle cx="174" cy="108" r="14" fill="#52D6FF"/>
+    <circle cx="222" cy="110" r="16" fill="#52D6FF"/>
+
+    <circle cx="268" cy="122" r="12" fill="#68E0A0"/>
+    <circle cx="308" cy="144" r="16" fill="#68E0A0"/>
+
+    <circle cx="336" cy="178" r="12" fill="#F2C36B"/>
+    <circle cx="354" cy="222" r="18" fill="#F2C36B"/>
+
+    <circle cx="348" cy="268" r="12" fill="#C79CFF"/>
+    <circle cx="330" cy="306" r="16" fill="#C79CFF"/>
+
+    <circle cx="300" cy="334" r="12" fill="#FF8D86"/>
+    <circle cx="260" cy="348" r="16" fill="#FF8D86"/>
+
+    <circle cx="216" cy="352" r="12" fill="#52D6FF"/>
+    <circle cx="170" cy="350" r="16" fill="#52D6FF"/>
+    <circle cx="126" cy="348" r="18" fill="#52D6FF"/>
+    <circle cx="126" cy="304" r="12" fill="#52D6FF"/>
+    <circle cx="126" cy="258" r="16" fill="#52D6FF"/>
+    <circle cx="126" cy="212" r="12" fill="#52D6FF"/>
+    <circle cx="126" cy="160" r="16" fill="#52D6FF"/>
+  </g>
+</svg>

@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  workflow_dispatch:          # manual: build artifacts only (no release)
+  push:
+    tags: ['v*']              # tag push: build + publish GitHub Release
+
+# 只读源码 + 写 Release（发布时用）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS arm64 —— 主架构，发布自动更新元数据
+          - os: macos-latest
+            prepare: darwin-arm64
+            build: --mac --arm64
+            publish: always
+          # macOS x64 —— Rosetta 交叉（runner 是 arm64），只出产物，不发布（避免覆盖 latest-mac.yml）
+          - os: macos-latest
+            prepare: darwin-x64
+            build: --mac --x64
+            publish: never
+          # Linux x64 —— 主架构
+          - os: ubuntu-latest
+            prepare: linux-x64
+            build: --linux --x64
+            publish: always
+          # Linux arm64（GitHub arm64 runner）
+          - os: ubuntu-24.04-arm
+            prepare: linux-arm64
+            build: --linux --arm64
+            publish: always
+          # Windows x64
+          - os: windows-latest
+            prepare: win32-x64
+            build: --win --x64
+            publish: always
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      HARBOR_TARGET_ARCH: ${{ matrix.prepare }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # 缓存 dsh 引擎 + Node 运行时（按架构分 key，命中后 prepare 秒级完成）
+      - name: Cache engine resources
+        uses: actions/cache@v4
+        with:
+          path: |
+            resources/cache
+            resources/node
+            resources/dsh
+          key: resources-${{ matrix.prepare }}-${{ hashFiles('package.json', 'scripts/prepare-dsh.js') }}
+          restore-keys: |
+            resources-${{ matrix.prepare }}-
+
+      - name: Prepare engine resources
+        run: node scripts/prepare-dsh.js
+
+      - name: Smoke test
+        run: npm test
+
+      # 构建（--publish 由矩阵决定：tag 触发时主架构上传 GitHub Release）
+      - name: Build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder ${{ matrix.build }} --publish ${{ matrix.publish }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-${{ matrix.prepare }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error

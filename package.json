@@ -1,0 +1,31 @@
+{
+  "name": "dshed",
+  "version": "0.1.0",
+  "description": "Cross-platform desktop client for DeepSeek Harness (dsh)",
+  "author": {
+    "name": "mcattx"
+  },
+  "license": "MIT",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "prepare:dsh": "node scripts/prepare-dsh.js",
+    "verify": "node scripts/verify.js",
+    "dist": "electron-builder",
+    "dist:dir": "electron-builder --dir"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "43.4.0",
+    "electron-builder": "^26.15.3",
+    "sharp": "^0.35.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mcattx/Harbor.git"
+  },
+  "productName": "dshed"
+}

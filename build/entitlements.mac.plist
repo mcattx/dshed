@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- hardened runtime: allow Electron JIT (V8 baseline/W^X also depends on it) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <!-- V8 non-JIT executable memory (W^X pages) -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- allow dlopen of unsigned native modules (.node in the dsh dependency tree, e.g. sqlite) -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <!-- Deliberately no App Sandbox: needs to spawn subprocesses and listen on localhost. -->
+</dict>
+</plist>

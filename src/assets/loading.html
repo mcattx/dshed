@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <title>dshed</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: rgb(21, 21, 23); /* neutral-bluish-950 */ color: #e6e8eb; }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+           font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.08); border-top-color: rgb(65, 118, 230);
+               border-radius: 50%; animation: spin 1s linear infinite; }
+    .brand { width: 96px; height: 96px; margin-bottom: 20px; }
+    .title { margin-top: 20px; font-size: 16px; letter-spacing: 1px; }
+    .sub { margin-top: 8px; font-size: 13px; color: #8b98a5; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="brand">
+    <svg viewBox="0 0 512 512" width="96" height="96" aria-hidden="true">
+      <rect x="28" y="28" width="456" height="456" rx="72" fill="#151517" stroke="#30475E" stroke-width="18"/>
+      <path d="M390 96h52v52" fill="none" stroke="#52D6FF" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+      <g transform="translate(16 24)">
+        <circle cx="126" cy="108" r="18" fill="#52D6FF"/>
+        <circle cx="174" cy="108" r="14" fill="#52D6FF"/>
+        <circle cx="222" cy="110" r="16" fill="#52D6FF"/>
+        <circle cx="268" cy="122" r="12" fill="#68E0A0"/>
+        <circle cx="308" cy="144" r="16" fill="#68E0A0"/>
+        <circle cx="336" cy="178" r="12" fill="#F2C36B"/>
+        <circle cx="354" cy="222" r="18" fill="#F2C36B"/>
+        <circle cx="348" cy="268" r="12" fill="#C79CFF"/>
+        <circle cx="330" cy="306" r="16" fill="#C79CFF"/>
+        <circle cx="300" cy="334" r="12" fill="#FF8D86"/>
+        <circle cx="260" cy="348" r="16" fill="#FF8D86"/>
+        <circle cx="216" cy="352" r="12" fill="#52D6FF"/>
+        <circle cx="170" cy="350" r="16" fill="#52D6FF"/>
+        <circle cx="126" cy="348" r="18" fill="#52D6FF"/>
+        <circle cx="126" cy="304" r="12" fill="#52D6FF"/>
+        <circle cx="126" cy="258" r="16" fill="#52D6FF"/>
+        <circle cx="126" cy="212" r="12" fill="#52D6FF"/>
+        <circle cx="126" cy="160" r="16" fill="#52D6FF"/>
+      </g>
+    </svg>
+  </div>
+  <div class="spinner"></div>
+  <div class="title">dshed</div>
+  <div class="sub" data-zh="正在启动 DeepSeek Harness 引擎…" data-en="Starting the DeepSeek Harness engine…"></div>
+  <script>
+    var lang = new URLSearchParams(location.search).get('lang')
+    if (lang === 'zh') {
+      document.querySelector('.sub').textContent = document.querySelector('.sub').dataset.zh
+      document.title = 'dshed · 启动中'
+    } else {
+      document.querySelector('.sub').textContent = document.querySelector('.sub').dataset.en
+      document.title = 'dshed · Starting'
+    }
+  </script>
+</body>
+</html>

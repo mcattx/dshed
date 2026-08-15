@@ -1,0 +1,13 @@
+node_modules/
+resources/
+dist/
+*.log
+.DS_Store
+
+# Documents that do not need to be disclosed
+internal/
+AGENTS.md
+CLAUDE.md
+
+# 临时/无关文件
+website/

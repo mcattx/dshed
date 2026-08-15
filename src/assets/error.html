@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <title>dshed · Error</title>
+  <style>
+    /* dshed 自有页面 — 对齐 dsh 深色主题 token（见 internal/dsh-design.md） */
+    :root {
+      --bg: rgb(21, 21, 23);            /* neutral-bluish-950 页面背景 */
+      --panel: rgb(44, 44, 46);         /* neutral-bluish-850 卡片 */
+      --border: rgba(255, 255, 255, 0.08);
+      --text-primary: rgb(249, 250, 251); /* neutral-bluish-50 */
+      --text-secondary: rgb(151, 157, 166); /* neutral-bluish-500 */
+      --brand: rgb(65, 118, 230);       /* deepseek-500 */
+    }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text-primary); }
+    body { display: flex; flex-direction: column; align-items: center; justify-content: center;
+           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+                        'Microsoft YaHei', sans-serif; }
+    .icon { width: 44px; height: 44px; margin-bottom: 20px; color: var(--text-secondary); }
+    .title { font-size: 17px; font-weight: 600; letter-spacing: 0.2px; }
+    .detail { margin-top: 10px; font-size: 13px; color: var(--text-secondary);
+              max-width: 520px; text-align: center; line-height: 1.6; word-break: break-all; }
+    .retry { margin-top: 28px; padding: 8px 28px; border-radius: 8px;
+             background: var(--text-primary); color: rgb(15, 17, 21);
+             border: none; font-size: 14px; font-weight: 500; cursor: pointer; }
+    .retry:hover { opacity: 0.9; }
+  </style>
+</head>
+<body>
+  <!-- 线条风格警告图标（dsh 风格，不用 emoji） -->
+  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+       stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="10"/>
+    <line x1="12" y1="8" x2="12" y2="12"/>
+    <circle cx="12" cy="16" r="0.5" fill="currentColor"/>
+  </svg>
+  <div class="title" data-zh="启动失败" data-en="Startup failed"></div>
+  <div class="detail" id="detail" data-zh="发生未知错误，请查看日志后重试。"
+       data-en="An unexpected error occurred. Please check the logs and retry."></div>
+  <button class="retry" id="retry" data-zh="重试" data-en="Retry"></button>
+  <script>
+    var params = new URLSearchParams(location.search)
+    var lang = params.get('lang') || 'en'
+    var zh = lang === 'zh'
+    var title = document.querySelector('.title')
+    var retry = document.querySelector('#retry')
+    title.textContent = zh ? title.dataset.zh : title.dataset.en
+    retry.textContent = zh ? retry.dataset.zh : retry.dataset.en
+    document.title = zh ? 'dshed · 出错了' : 'dshed · Error'
+    var reason = params.get('reason')
+    if (reason && reason !== 'null') {
+      document.getElementById('detail').textContent = (zh ? '原因：' : 'Reason: ') + decodeURIComponent(reason)
+    }
+    document.getElementById('retry').addEventListener('click', function () {
+      location.reload()
+    })
+  </script>
+</body>
+</html>

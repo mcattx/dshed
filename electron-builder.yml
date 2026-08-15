@@ -1,0 +1,85 @@
+# Harbor Desktop 打包配置（M2 使用，先落骨架）
+# 产物矩阵：win-x64 / mac-x64 / mac-arm64 / linux-x64 / linux-arm64（独立产物）
+
+appId: com.dshed.desktop
+productName: dshed
+
+# 自动更新发布渠道：GitHub Releases（等仓库重建后启用；electron-updater 读取此配置）
+publish:
+  provider: github
+  owner: mcattx
+  repo: dshed
+
+# 打包产物含更新元数据（latest-mac.yml / latest.yml），供 electron-updater 检测
+
+directories:
+  output: dist
+  buildResources: build
+
+files:
+  - src/**/*
+  - package.json
+
+afterSign: build/after-sign.js
+
+# 独立 Node 运行时 + dsh 引擎，不在 asar 内（extraResources）
+# 注意：electron-builder 的 filter 硬性跳过「根目录」node_modules（filter.js），
+# 因此从 resources/ 整体复制，让 dsh/node_modules 成为子路径，避免被过滤。
+extraResources:
+  - from: resources
+    to: ''
+    filter:
+      - 'node/**/*'
+      - 'dsh/**/*'
+
+asarUnpack: []
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  artifactName: dshed-${version}-win-${arch}.${ext}
+  requestedExecutionLevel: asInvoker
+  icon: build/icon.ico
+
+nsis:
+  # 许可协议（安装器协议页）
+  license: LICENSE
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  # 卸载时默认保留用户数据（userData 不在安装目录）
+  deleteAppDataOnUninstall: false
+
+mac:
+  target:
+    - target: dmg
+      # 架构由 CLI 每次指定（resources 为单架构，必须 per-arch 构建）
+    # zip 是 macOS 自动更新的载体（electron-updater 要求，dmg 不用于更新）
+    - target: zip
+  artifactName: dshed-${version}-mac-${arch}.${ext}
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # 不自动发现/使用任何开发者证书（本项目不用公司证书）；
+  # 未来配个人证书后在 identity 里指定
+  identity: null
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  icon: build/icon.icns
+
+dmg:
+  # 许可协议（安装时显示）
+  license: LICENSE
+  contents:
+    - { x: 130, y: 220 }
+    - { x: 410, y: 220, type: link, path: /Applications }
+
+linux:
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64, arm64]
+  artifactName: dshed-${version}-linux-${arch}.${ext}
+  category: Network
+  maintainer: dshed
+  icon: build/icons/

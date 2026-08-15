@@ -12,7 +12,8 @@
     "prepare:dsh": "node scripts/prepare-dsh.js",
     "verify": "node scripts/verify.js",
     "dist": "electron-builder",
-    "dist:dir": "electron-builder --dir"
+    "dist:dir": "electron-builder --dir",
+    "test": "node scripts/verify.js"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",

@@ -89,7 +89,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: harbor-${{ matrix.prepare }}
+          name: dshed-${{ matrix.prepare }}
           path: |
             dist/*.dmg
             dist/*.zip

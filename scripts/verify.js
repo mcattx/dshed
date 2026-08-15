@@ -141,7 +141,10 @@ async function main() {
 
   console.log('\n[5] crash restart: kill -9 → auto restart on a new port')
   const portA = await engine.start()
-  process.kill(-engine.child.pid, 'SIGKILL')
+  // Windows has no process groups (engine is not detached there); kill the
+  // pid directly. Unix uses the negative pid to signal the whole group.
+  const killPid = process.platform === 'win32' ? engine.child.pid : -engine.child.pid
+  process.kill(killPid, 'SIGKILL')
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('restart timeout')), 25000)
     engine.once('restarted', (p) => {

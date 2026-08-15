@@ -203,7 +203,14 @@ class EngineManager extends EventEmitter {
 
     this.logger.info(`[engine] stopping: SIGTERM pid=${pid}`)
     const exited = new Promise((resolve) => child.once('exit', resolve))
-    child.kill('SIGTERM')
+    if (process.platform === 'win32') {
+      // Windows: SIGTERM is a hard TerminateProcess anyway and does not give
+      // the engine a chance to clean up its child processes (workers/sandbox);
+      // kill the whole tree so no orphan holds the port.
+      this._killTree(pid)
+    } else {
+      child.kill('SIGTERM')
+    }
 
     const graceful = await Promise.race([
       exited.then(() => 'exited'),

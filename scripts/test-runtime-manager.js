@@ -397,6 +397,21 @@ async function main() {
     rel2()
   }
 
+  console.log('\n[5d] release requires matching token (pid reuse safety)')
+  {
+    const lockPath = path.join(tmpdir('lock-token'), 'install.lock')
+    const release = await acquireLock(lockPath, { timeoutMs: 1000 })
+    ok(fs.existsSync(lockPath), 'lock acquired')
+
+    // simulate a different owner with the same pid but a different token
+    const cur = JSON.parse(fs.readFileSync(lockPath, 'utf8'))
+    fs.writeFileSync(lockPath, JSON.stringify({ ...cur, token: 'different-token' }))
+
+    release() // must NOT unlink a lock we do not own
+    ok(fs.existsSync(lockPath), 'release does not remove a lock with a different token')
+    fs.unlinkSync(lockPath)
+  }
+
   console.log('\n[5b] two-process install race')
   {
     const lockPath = path.join(tmpdir('race'), 'install.lock')

@@ -156,7 +156,12 @@ async function acquireLock(lockPath, { timeoutMs = 30000, pollMs = 100, logger }
   const deadline = Date.now() + timeoutMs
   const log = logger || { info: () => {}, warn: () => {}, error: () => {} }
   fs.mkdirSync(path.dirname(lockPath), { recursive: true })
-  const owner = { pid: process.pid, hostname: require('node:os').hostname(), createdAt: new Date().toISOString() }
+  const owner = {
+    pid: process.pid,
+    token: crypto.randomBytes(16).toString('hex'),
+    hostname: require('node:os').hostname(),
+    createdAt: new Date().toISOString(),
+  }
 
   while (true) {
     try {
@@ -166,12 +171,17 @@ async function acquireLock(lockPath, { timeoutMs = 30000, pollMs = 100, logger }
       return () => {
         try {
           const cur = readJson(lockPath)
-          if (cur && cur.pid === process.pid) fs.unlinkSync(lockPath)
+          // release only our own lock: match pid AND token so a reused pid that
+          // happens to equal ours (or a foreign owner) can never be unlinked
+          if (cur && cur.pid === process.pid && cur.token === owner.token) fs.unlinkSync(lockPath)
         } catch (e) { /* ignore */ }
       }
     } catch (e) {
       if (e.code !== 'EEXIST') throw e
       const cur = readJson(lockPath)
+      // stale only when the recorded pid no longer exists; EPERM means it exists
+      // but we cannot signal it, so treat as alive (conservative). The token is
+      // what makes release safe under pid reuse.
       if (cur && cur.pid && !isAlive(cur.pid)) {
         log.warn(`[runtime] removing stale lock (pid ${cur.pid} gone)`)
         try { fs.unlinkSync(lockPath) } catch (e2) { /* raced, retry below */ }

@@ -18,6 +18,7 @@ const {
   beginActivation, commitActivation, failActivation, commitRollback,
   resolveReadyRuntime,
 } = require('./runtime-manager')
+const { runBackgroundUpdate } = require('./runtime-update-coordinator')
 
 // —— 文件日志：打包版双击启动无终端，stdout/stderr 会丢失；落盘到
 // userData/logs/main.log（mac: ~/Library/Application Support/dshed/logs，
@@ -147,6 +148,18 @@ async function bootstrap() {
   createWindow()
   if (!process.env.HARBOR_E2E) createTray()
   initUpdater({ logger })
+
+  // background dsh runtime update: check + download + prepare a pending runtime
+  // for the next cold start. Non-blocking; never interrupts the running Agent.
+  if (!process.env.HARBOR_E2E) {
+    runBackgroundUpdate({
+      runtimeRoot,
+      platform: process.platform,
+      arch: process.arch,
+      currentDshedVersion: app.getVersion(),
+      logger,
+    }).catch((e) => logger.error(`[dshed] background update errored: ${e.message}`))
+  }
 }
 
 /**

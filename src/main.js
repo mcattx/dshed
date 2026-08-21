@@ -13,7 +13,10 @@ const { migrateLegacyDsh, recordVersion } = require('./migration')
 const { initUpdater } = require('./updater')
 const { t, pageLang } = require('./i18n')
 const {
-  getActiveRuntime, ensureRuntime, activateRuntime, markRuntimeHealthy, rollbackRuntime, purgeRuntimeCache,
+  ensureRuntime, purgeRuntimeCache,
+  readRuntimeState, migrateLegacyState, recoverInterruptedTransition, selectStartupCandidate,
+  beginActivation, commitActivation, failActivation, commitRollback,
+  resolveReadyRuntime,
 } = require('./runtime-manager')
 
 // —— 文件日志：打包版双击启动无终端，stdout/stderr 会丢失；落盘到
@@ -147,51 +150,83 @@ async function bootstrap() {
 }
 
 /**
- * Resolve a runnable dsh runtime (active, or install the bundled local
- * artifact on first run), start it and health-check it. A pending runtime that
- * fails to start triggers rollback to the previous known-good runtime; if that
- * also fails the error propagates to showFatalError.
+ * Resolve a runnable dsh runtime and start it. Priority: pending (cold-start
+ * candidate) → active → previous → bundled rescue. A pending or previous
+ * runtime is only promoted to active after its health check succeeds; a failed
+ * pending is recorded as failed and falls through to active.
  */
 async function startEngineWithRuntime({ nodeBin, runtimeRoot, dshHome }) {
-  const rt = await resolveRuntime({ runtimeRoot, nodeBin })
-  try {
-    engine = createEngine(nodeBin, path.join(rt.runtimeDir, rt.entry), dshHome)
-    const port = await engine.start()
-    // only a freshly-pending runtime needs to be promoted to active; an already
-    // active runtime is simply re-started in place.
-    if (rt.needsActivation) {
-      markRuntimeHealthy({ runtimeRoot, runtimeId: rt.runtimeId, logger })
+  migrateLegacyState({ runtimeRoot, logger })
+  recoverInterruptedTransition({ runtimeRoot, logger })
+  const candidates = selectStartupCandidate({ runtimeRoot })
+
+  // 1) pending: cold-start candidate — commit on success, fail on error
+  if (candidates.pending) {
+    const rt = beginActivation({ runtimeRoot, runtimeId: candidates.pending, logger })
+    const started = await tryStart(nodeBin, rt, dshHome)
+    if (started.ok) {
+      commitActivation({ runtimeRoot, runtimeId: candidates.pending, logger })
+      return started.port
     }
-    return port
+    failActivation({ runtimeRoot, runtimeId: candidates.pending, reason: started.error, logger })
+  }
+
+  // 2) active: already healthy — just start it in place
+  if (candidates.active) {
+    const rt = resolveReadyRuntime(runtimeRoot, candidates.active)
+    const started = await tryStart(nodeBin, rt, dshHome)
+    if (started.ok) return started.port
+  }
+
+  // 3) previous: only promoted to active after a successful health check
+  if (candidates.previous) {
+    const rt = resolveReadyRuntime(runtimeRoot, candidates.previous)
+    const started = await tryStart(nodeBin, rt, dshHome)
+    if (started.ok) {
+      commitRollback({ runtimeRoot, runtimeId: candidates.previous, logger })
+      return started.port
+    }
+  }
+
+  // 4) bundled rescue: first run / nothing else runnable
+  const rescue = await installBundledRescue({ runtimeRoot })
+  if (rescue) {
+    const rt = beginActivation({ runtimeRoot, runtimeId: rescue.runtimeId, logger })
+    const started = await tryStart(nodeBin, rt, dshHome)
+    if (started.ok) {
+      commitActivation({ runtimeRoot, runtimeId: rescue.runtimeId, logger })
+      return started.port
+    }
+    failActivation({ runtimeRoot, runtimeId: rescue.runtimeId, reason: started.error, logger })
+  }
+
+  throw new Error('no runnable dsh runtime available')
+}
+
+/** start + health-check a runtime; returns { ok, port } or { ok:false, error } */
+async function tryStart(nodeBin, rt, dshHome) {
+  const em = createEngine(nodeBin, path.join(rt.runtimeDir, rt.entry), dshHome)
+  try {
+    const port = await em.start()
+    engine = em
+    return { ok: true, port }
   } catch (err) {
-    logger.error(`[dshed] runtime ${rt.runtimeId} failed to start, rolling back: ${err.message}`)
-    if (engine) await engine.stop().catch(() => {})
-    const prev = rollbackRuntime({ runtimeRoot, logger })
-    if (!prev) throw err
-    // rollbackRuntime already restored `prev` as active; just start it (no
-    // re-activation needed — it is the last known-good runtime).
-    engine = createEngine(nodeBin, path.join(prev.runtimeDir, prev.entry), dshHome)
-    const port = await engine.start()
-    logger.info(`[dshed] rolled back to ${prev.runtimeId}`)
-    return port
+    await em.stop().catch(() => {})
+    return { ok: false, error: err.message }
   }
 }
 
-/** Resolve active runtime, or install the bundled local artifact on first run */
-async function resolveRuntime({ runtimeRoot, nodeBin }) {
-  const active = getActiveRuntime({ runtimeRoot, logger })
-  if (active) {
-    return { runtimeId: active.runtimeId, runtimeDir: active.runtimeDir, entry: active.entry, needsActivation: false }
-  }
+/** install the bundled rescue artifact (resources/dsh-runtimes) if present */
+async function installBundledRescue({ runtimeRoot }) {
   const base = resourceBase()
   const manifestPath = path.join(base, 'dsh-runtimes', 'dsh-runtime-manifest.json')
+  if (!fs.existsSync(manifestPath)) return null
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
   const archivePath = path.join(base, 'dsh-runtimes', manifest.archive)
   const installed = await ensureRuntime({
     runtimeRoot, manifest, archivePath, platform: process.platform, arch: process.arch, logger,
   })
-  const pending = activateRuntime({ runtimeRoot, runtimeId: installed.runtimeId, logger })
-  return { runtimeId: pending.runtimeId, runtimeDir: pending.runtimeDir, entry: pending.entry, needsActivation: true }
+  return resolveReadyRuntime(runtimeRoot, installed.runtimeId)
 }
 
 /** Build an EngineManager with explicit paths and wire crash/restart events */

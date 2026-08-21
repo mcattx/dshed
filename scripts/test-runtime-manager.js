@@ -335,6 +335,7 @@ async function main() {
     const root = tmpdir('corrupt')
     const { archive, manifest } = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch })
+    activateRuntime({ runtimeRoot: root, runtimeId: manifest.runtimeId })
     markRuntimeHealthy({ runtimeRoot: root, runtimeId: manifest.runtimeId })
 
     // corrupt complete.json (bad sha256) → active runtime no longer resolves as ready
@@ -353,6 +354,24 @@ async function main() {
     let threw = false
     try { await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch }) } catch (e) { threw = true }
     ok(threw, 'identity mismatch refuses reinstall instead of overwriting')
+  }
+
+  console.log('\n[4d] corrupt runtime is isolated and reinstalled')
+  {
+    const root = tmpdir('recover')
+    const { archive, manifest } = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch })
+
+    // corrupt complete.json so readComplete() returns null but the dir still exists
+    const completePath = path.join(root, 'runtimes', manifest.runtimeId, 'complete.json')
+    fs.writeFileSync(completePath, JSON.stringify({ formatVersion: 1, runtimeId: manifest.runtimeId, buildId: manifest.buildId, sha256: 'not-a-sha', entry: manifest.entry }))
+
+    const r = await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch })
+    ok(r.runtimeId === manifest.runtimeId, 'reinstalled after corruption')
+    ok(fs.existsSync(path.join(r.runtimeDir, 'complete.json')), 'complete.json restored')
+    ok(fs.existsSync(path.join(r.runtimeDir, manifest.entry)), 'entry restored after reinstall')
+    const names = fs.readdirSync(path.join(root, 'runtimes'))
+    ok(names.every((n) => !n.includes('.failed-')), 'no .failed-* left after successful reinstall')
   }
 
   // ————————————————— [5] lock —————————————————
@@ -470,6 +489,7 @@ async function main() {
     const root = tmpdir('stale-pending')
     const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
     markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
     // simulate an interrupted activation
     fs.writeFileSync(path.join(root, 'pending.json'), JSON.stringify({ runtimeId: 'ghost', pendingAt: new Date().toISOString() }))
@@ -478,12 +498,49 @@ async function main() {
     ok(!fs.existsSync(path.join(root, 'pending.json')), 'stale pending cleared')
   }
 
+  console.log('\n[6c] markRuntimeHealthy rejects invalid states; malicious runtimeId cannot resolve')
+  {
+    const root = tmpdir('strict-healthy')
+    const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+
+    // no pending → rejected, and no active.json written
+    let threw = false
+    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId }) } catch (e) { threw = true }
+    ok(threw, 'markRuntimeHealthy without pending rejected')
+    ok(!fs.existsSync(path.join(root, 'active.json')), 'no active.json written on invalid markHealthy')
+
+    // pending exists but points at a different runtime → rejected
+    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    b.manifest = { ...b.manifest, runtimeId: `dsh-other-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
+    await ensureRuntime({ runtimeRoot: root, manifest: b.manifest, archivePath: b.archive, platform: process.platform, arch: process.arch })
+    let threw2 = false
+    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: b.manifest.runtimeId }) } catch (e) { threw2 = true }
+    ok(threw2, 'markRuntimeHealthy with mismatched pending rejected')
+
+    // nonexistent runtime → rejected
+    let threw3 = false
+    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: `dsh-nonexistent-deadbee-${process.platform}-${process.arch}` }) } catch (e) { threw3 = true }
+    ok(threw3, 'markRuntimeHealthy for nonexistent runtime rejected')
+
+    // unsafe runtimeId → rejected (no traversal)
+    let threw4 = false
+    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: '../../etc/passwd' }) } catch (e) { threw4 = true }
+    ok(threw4, 'markRuntimeHealthy for unsafe runtimeId rejected')
+
+    // active.json containing a malicious runtimeId must not resolve (no escape)
+    fs.writeFileSync(path.join(root, 'active.json'), JSON.stringify({ runtimeId: '../../escape', activatedAt: new Date().toISOString() }))
+    ok(getActiveRuntime({ runtimeRoot: root }) === null, 'malicious active runtimeId does not resolve')
+  }
+
   // ————————————————— [7] purge —————————————————
   console.log('\n[7] purgeRuntimeCache')
   {
     const root = tmpdir('purge')
     const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
     markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
 
     // a second non-active runtime + downloads + staging to be purged

@@ -184,6 +184,7 @@ function unpackArchive(archivePath, destDir, opts = {}) {
     let pendingLongName = null
     let fileCount = 0
     let extractedSize = 0
+    let zeroBlocks = 0
     let sawEnd = false
     let settled = false
 
@@ -216,10 +217,19 @@ function unpackArchive(archivePath, destDir, opts = {}) {
         buf = Buffer.concat([buf, chunk])
         while (buf.length >= BLOCK) {
           const header = buf.slice(0, BLOCK)
-          // two zero blocks = end of archive
+          // two consecutive zero blocks mark the end of archive
           if (header.every((b) => b === 0)) {
-            sawEnd = true
-            break
+            zeroBlocks += 1
+            buf = buf.slice(BLOCK)
+            if (zeroBlocks >= 2) {
+              sawEnd = true
+              break
+            }
+            continue
+          }
+          if (zeroBlocks > 0) {
+            fail(new Error('non-zero data after end-of-archive block'))
+            return
           }
           if (!verifyChecksum(header)) {
             fail(new Error('tar header checksum mismatch'))

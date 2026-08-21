@@ -10,13 +10,11 @@ const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const http = require('node:http')
 
 const {
   fetchManifest, validateMatrix, matchArtifact, deriveArtifactUrl, resolveArtifact,
   STABLE_MANIFEST_URL, PREVIEW_MANIFEST_URL, MAX_MANIFEST_BYTES, OWNER, REPO,
 } = require('../src/runtime-manifest-client')
-const { httpTransport } = require('../src/runtime-downloader')
 
 let passed = 0
 let failed = 0
@@ -57,16 +55,17 @@ function makeMatrix(overrides = {}) {
   }, overrides)
 }
 
-function createServer(body, { statusCode = 200, headers = {} } = {}) {
-  return new Promise((resolve) => {
-    const server = http.createServer((req, res) => {
-      res.writeHead(statusCode, { 'Content-Type': 'application/json', ...headers })
-      res.end(body)
-    })
-    server.listen(0, '127.0.0.1', () => {
-      resolve({ server, url: `http://127.0.0.1:${server.address().port}/manifest.json` })
-    })
-  })
+/** fake transport: records the requested URL and returns a canned body */
+function makeFakeTransport(body, { statusCode = 200 } = {}) {
+  const { Readable } = require('node:stream')
+  const calls = []
+  return {
+    calls,
+    request: async (url) => {
+      calls.push(url)
+      return { statusCode, headers: {}, stream: Readable.from([Buffer.from(body)]) }
+    },
+  }
 }
 
 async function main() {
@@ -129,68 +128,78 @@ async function main() {
     ok(threw, 'unsafe archive rejected')
   }
 
-  console.log('\n[4] fetchManifest resolves platform/arch artifact')
+  console.log('\n[4] fetchManifest uses fixed endpoint + resolves artifact')
   {
-    const { server, url } = await createServer(JSON.stringify(makeMatrix()))
-    const r = await fetchManifest({
-      channel: 'stable', platform: 'darwin', arch: 'arm64', transport: httpTransport, url,
-    })
+    const t = makeFakeTransport(JSON.stringify(makeMatrix()))
+    const r = await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: t })
+    ok(t.calls.length === 1 && t.calls[0] === STABLE_MANIFEST_URL, 'hits the fixed stable endpoint')
     ok(r.runtimeId === ARTIFACT.runtimeId, 'fetchManifest resolves artifact')
     ok(r.artifactUrl.startsWith('https://github.com/'), 'fetchManifest derives artifactUrl')
-    server.close()
+  }
+
+  console.log('\n[4b] caller-supplied URL is not honored')
+  {
+    const t = makeFakeTransport(JSON.stringify(makeMatrix()))
+    await fetchManifest({
+      channel: 'stable', platform: 'darwin', arch: 'arm64', transport: t,
+      url: 'https://evil.example.com/attacker/manifest.json',
+    })
+    ok(t.calls[0] === STABLE_MANIFEST_URL, 'injected url ignored, still uses fixed endpoint')
+  }
+
+  console.log('\n[4c] preview channel uses fixed preview endpoint')
+  {
+    const t = makeFakeTransport(JSON.stringify(makeMatrix()))
+    await fetchManifest({ channel: 'preview', platform: 'darwin', arch: 'arm64', transport: t })
+    ok(t.calls[0] === PREVIEW_MANIFEST_URL, 'preview channel hits the fixed preview endpoint')
   }
 
   console.log('\n[5] minimumDshedVersion enforced')
   {
     const m = makeMatrix()
     m.latest.minimumDshedVersion = '0.2.0'
-    const { server, url } = await createServer(JSON.stringify(m))
+    const t = makeFakeTransport(JSON.stringify(m))
     let threw = false
     try {
-      await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', currentDshedVersion: '0.1.0', transport: httpTransport, url })
+      await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', currentDshedVersion: '0.1.0', transport: t })
     } catch (e) { threw = true }
     ok(threw, 'older shell rejected')
-    server.close()
   }
 
   console.log('\n[6] manifest body cap enforced')
   {
     const big = JSON.stringify(makeMatrix({ latest: { ...makeMatrix().latest, pad: 'x'.repeat(MAX_MANIFEST_BYTES) } }))
-    const { server, url } = await createServer(big)
+    const t = makeFakeTransport(big)
     let threw = false
     try {
-      await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: httpTransport, url })
+      await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: t })
     } catch (e) { threw = true }
     ok(threw, 'oversized manifest rejected')
-    server.close()
   }
 
   console.log('\n[7] non-200 and invalid JSON rejected')
   {
-    const s1 = await createServer('not found', { statusCode: 404 })
+    const t1 = makeFakeTransport('not found', { statusCode: 404 })
     let threw = false
-    try { await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: httpTransport, url: s1.url }) } catch (e) { threw = true }
+    try { await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: t1 }) } catch (e) { threw = true }
     ok(threw, 'non-200 rejected')
-    s1.server.close()
 
-    const s2 = await createServer('{ not json')
+    const t2 = makeFakeTransport('{ not json')
     let threw2 = false
-    try { await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: httpTransport, url: s2.url }) } catch (e) { threw2 = true }
+    try { await fetchManifest({ channel: 'stable', platform: 'darwin', arch: 'arm64', transport: t2 }) } catch (e) { threw2 = true }
     ok(threw2, 'invalid JSON rejected')
-    s2.server.close()
   }
 
   console.log('\n[8] unknown channel / missing platform rejected')
   {
-    const { server, url } = await createServer(JSON.stringify(makeMatrix()))
+    const t = makeFakeTransport(JSON.stringify(makeMatrix()))
     let threw = false
-    try { await fetchManifest({ channel: 'beta', platform: 'darwin', arch: 'arm64', transport: httpTransport, url }) } catch (e) { threw = true }
+    try { await fetchManifest({ channel: 'beta', platform: 'darwin', arch: 'arm64', transport: t }) } catch (e) { threw = true }
     ok(threw, 'unknown channel rejected')
 
     let threw2 = false
-    try { await fetchManifest({ channel: 'stable', transport: httpTransport, url }) } catch (e) { threw2 = true }
+    try { await fetchManifest({ channel: 'stable', transport: t }) } catch (e) { threw2 = true }
     ok(threw2, 'missing platform/arch rejected')
-    server.close()
   }
 
   console.log('\n[9] fixed endpoints')

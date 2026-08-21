@@ -137,14 +137,16 @@ async function fetchManifest(options) {
     transport = httpsTransport,
     signal,
     logger,
-    url,
   } = options
   const log = logger || { info: () => {}, warn: () => {}, error: () => {} }
 
   if (channel !== 'stable' && channel !== 'preview') throw new Error(`unknown channel: ${channel}`)
   if (!platform || !arch) throw new Error('platform and arch are required')
 
-  const manifestUrl = url || (channel === 'preview' ? PREVIEW_MANIFEST_URL : STABLE_MANIFEST_URL)
+  // the manifest endpoint is fixed and never caller-supplied: production always
+  // hits the built-in stable/preview endpoint on the fixed owner/repo. Only the
+  // transport is injectable (for tests); the URL is derived from `channel`.
+  const manifestUrl = channel === 'preview' ? PREVIEW_MANIFEST_URL : STABLE_MANIFEST_URL
   log.info(`[manifest] fetching ${channel} manifest`)
 
   const raw = await fetchManifestJson(manifestUrl, { transport, signal })

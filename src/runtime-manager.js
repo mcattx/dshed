@@ -411,6 +411,9 @@ async function ensureRuntime(options) {
         sha256: manifest.sha256,
         entry: manifest.entry,
         healthy: false,
+        ...(typeof manifest.minimumDshedVersion === 'string' ? { minimumDshedVersion: manifest.minimumDshedVersion } : {}),
+        ...(typeof manifest.releaseTag === 'string' ? { releaseTag: manifest.releaseTag } : {}),
+        ...(typeof manifest.channel === 'string' ? { channel: manifest.channel } : {}),
         createdAt: new Date().toISOString(),
       })
 
@@ -670,6 +673,39 @@ function retryFailedRuntime({ runtimeRoot, runtimeId, logger } = {}) {
   return { runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
 }
 
+/**
+ * Mark a ready runtime as the pending cold-start candidate without counting an
+ * attempt (attemptCount stays 0). Used by the background update coordinator to
+ * prepare a runtime for next launch; beginActivation is what actually counts an
+ * attempt at startup. Does not touch active.
+ */
+function preparePending({ runtimeRoot, runtimeId, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
+  const paths = runtimePaths(runtimeRoot)
+  const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
+  const state = readRuntimeState({ runtimeRoot })
+
+  state.pending = { runtimeId, attemptCount: 0, lastAttemptAt: null, failureReason: null }
+  writeState(paths, state)
+  log.info(`[runtime] prepared pending runtime ${runtimeId} for next launch`)
+  return { runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
+}
+
+/**
+ * Record the most recent delivery failure (manifest/download/verify/extract).
+ * This is distinct from `failed` (which is reserved for a runtime's cold-start
+ * failure) and never affects active.
+ */
+function recordLastUpdateError({ runtimeRoot, stage, message, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
+  const paths = runtimePaths(runtimeRoot)
+  const state = readRuntimeState({ runtimeRoot })
+  state.lastUpdateError = { stage: stage || null, message: message || null, at: new Date().toISOString() }
+  writeState(paths, state)
+  log.warn(`[runtime] update error (${stage}): ${message}`)
+  return state.lastUpdateError
+}
+
 // ————————————————————————————————— purge ————————————————————————————————————
 
 /**
@@ -724,6 +760,8 @@ module.exports = {
   failActivation,
   commitRollback,
   retryFailedRuntime,
+  preparePending,
+  recordLastUpdateError,
   resolveReadyRuntime,
   acquireLock,
   compareVersions,

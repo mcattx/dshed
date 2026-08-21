@@ -22,15 +22,17 @@ files:
 
 afterSign: build/after-sign.js
 
-# 独立 Node 运行时 + dsh 引擎，不在 asar 内（extraResources）
+# 独立 Node 运行时 + dsh 预打包 artifact，不在 asar 内（extraResources）
 # 注意：electron-builder 的 filter 硬性跳过「根目录」node_modules（filter.js），
 # 因此从 resources/ 整体复制，让 dsh/node_modules 成为子路径，避免被过滤。
+# 生产运行时通过 Runtime Manager 从 dsh-runtimes/<artifact> 安装 dsh 到 userData，
+# 不再打包原始 resources/dsh（仅开发/冒烟测试使用）。
 extraResources:
   - from: resources
     to: ''
     filter:
       - 'node/**/*'
-      - 'dsh/**/*'
+      - 'dsh-runtimes/**/*'
 
 asarUnpack: []
 

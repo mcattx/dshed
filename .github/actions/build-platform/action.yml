@@ -32,6 +32,7 @@ runs:
           resources/cache
           resources/node
           resources/dsh
+          resources/dsh-runtimes
         key: resources-${{ inputs.prepare }}-${{ hashFiles('package.json', 'scripts/prepare-dsh.js') }}
         restore-keys: |
           resources-${{ inputs.prepare }}-

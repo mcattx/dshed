@@ -13,7 +13,7 @@
     "verify": "node scripts/verify.js",
     "dist": "electron-builder",
     "dist:dir": "electron-builder --dir",
-    "test": "node scripts/verify.js"
+    "test": "node scripts/verify.js && node scripts/test-runtime-manager.js"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",

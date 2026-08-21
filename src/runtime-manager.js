@@ -275,16 +275,30 @@ function readComplete(runtimeDir) {
   return complete
 }
 
-function isReadyRuntime(runtimeDir) {
-  return readComplete(runtimeDir) !== null
-}
-
 /** true when a complete.json identity matches the manifest being installed */
 function completeMatches(complete, manifest) {
   return complete
     && complete.runtimeId === manifest.runtimeId
     && complete.buildId === manifest.buildId
     && complete.sha256 === manifest.sha256
+}
+
+/**
+ * Resolve a runtime by id into { runtimeId, runtimeDir, complete }, enforcing a
+ * safe dirname, root containment and readiness. Throws on any violation — this
+ * is the single entry point all state APIs use so a malicious/invalid runtimeId
+ * can never escape dsh-runtimes/runtimes/.
+ */
+function resolveReadyRuntime(runtimeRoot, runtimeId) {
+  if (typeof runtimeId !== 'string' || !isSafeDirName(runtimeId)) {
+    throw new Error(`invalid runtimeId: ${String(runtimeId)}`)
+  }
+  const paths = runtimePaths(runtimeRoot)
+  const runtimeDir = path.join(paths.runtimes, runtimeId)
+  assertInside(paths.runtimes, runtimeDir)
+  const complete = readComplete(runtimeDir)
+  if (!complete) throw new Error(`runtime not ready: ${runtimeId}`)
+  return { runtimeId, runtimeDir, complete }
 }
 
 // ————————————————————————————————— ensure ————————————————————————————————————
@@ -337,6 +351,18 @@ async function ensureRuntime(options) {
       throw new Error(`runtime ${manifest.runtimeId} exists with mismatched identity (buildId=${existing.buildId}, sha256=${existing.sha256})`)
     }
 
+    // runtimeDir exists but complete.json is invalid (corrupt/old-format):
+    // atomically isolate it so the reinstall can rename a fresh directory into
+    // place. The .failed-* dir is removed on success and left for diagnosis on
+    // failure (it is also cleaned up by purge).
+    let failedDir = null
+    if (fs.existsSync(runtimeDir)) {
+      failedDir = `${runtimeDir}.failed-${process.pid}-${Date.now()}`
+      assertInside(paths.runtimes, failedDir)
+      fs.renameSync(runtimeDir, failedDir)
+      log.warn(`[runtime] isolating corrupt runtime ${manifest.runtimeId} → ${failedDir}`)
+    }
+
     const stagingDir = path.join(paths.staging, manifest.runtimeId)
     assertInside(paths.staging, stagingDir)
     fs.rmSync(stagingDir, { recursive: true, force: true })
@@ -371,6 +397,7 @@ async function ensureRuntime(options) {
 
       fs.mkdirSync(paths.runtimes, { recursive: true })
       fs.renameSync(stagingDir, runtimeDir)
+      if (failedDir) fs.rmSync(failedDir, { recursive: true, force: true })
       log.info(`[runtime] installed ${manifest.runtimeId} → ${runtimeDir}`)
       return { runtimeId: manifest.runtimeId, runtimeDir }
     } catch (e) {
@@ -409,12 +436,12 @@ function getActiveRuntime(options) {
   }
 
   if (state.active && state.active.runtimeId) {
-    const dir = path.join(paths.runtimes, state.active.runtimeId)
-    if (isReadyRuntime(dir)) {
-      const complete = readJson(path.join(dir, COMPLETE_FILE))
-      return { runtimeId: state.active.runtimeId, runtimeDir: dir, manifest: state.active, entry: complete && complete.entry }
+    try {
+      const rt = resolveReadyRuntime(runtimeRoot, state.active.runtimeId)
+      return { runtimeId: rt.runtimeId, runtimeDir: rt.runtimeDir, manifest: state.active, entry: rt.complete.entry }
+    } catch (e) {
+      log.warn(`[runtime] active runtime not usable: ${e.message}`)
     }
-    log.warn(`[runtime] active runtime ${state.active.runtimeId} is not ready`)
   }
   return null
 }
@@ -427,13 +454,11 @@ function activateRuntime(options) {
   const { runtimeRoot, runtimeId, logger } = options
   const log = logger || { info: () => {}, warn: () => {}, error: () => {} }
   const paths = runtimePaths(runtimeRoot)
-  const runtimeDir = path.join(paths.runtimes, runtimeId)
-  if (!isReadyRuntime(runtimeDir)) throw new Error(`runtime not ready: ${runtimeId}`)
+  const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
 
   atomicWriteJson(paths.pending, { runtimeId, pendingAt: new Date().toISOString() })
-  const complete = readJson(path.join(runtimeDir, COMPLETE_FILE))
   log.info(`[runtime] pending activation: ${runtimeId}`)
-  return { runtimeId, runtimeDir, entry: complete && complete.entry }
+  return { runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
 }
 
 /**
@@ -446,12 +471,22 @@ function markRuntimeHealthy(options) {
   const paths = runtimePaths(runtimeRoot)
   const state = readState(paths)
 
-  const runtimeDir = path.join(paths.runtimes, runtimeId)
-  const completePath = path.join(runtimeDir, COMPLETE_FILE)
-  if (isReadyRuntime(runtimeDir)) {
-    const complete = readJson(completePath) || {}
-    atomicWriteJson(completePath, { ...complete, healthy: true })
+  // reject invalid/not-ready runtimes — never write active.json for one
+  const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
+
+  // activation must be driven by a matching pending marker
+  if (!state.pending || state.pending.runtimeId !== runtimeId) {
+    throw new Error(`runtime ${runtimeId} is not pending activation`)
   }
+
+  // entry must actually exist inside the runtime dir
+  const entryAbs = path.resolve(rt.runtimeDir, rt.complete.entry)
+  assertInside(rt.runtimeDir, entryAbs)
+  if (!fs.existsSync(entryAbs)) {
+    throw new Error(`runtime entry not found: ${rt.complete.entry}`)
+  }
+
+  atomicWriteJson(path.join(rt.runtimeDir, COMPLETE_FILE), { ...rt.complete, healthy: true })
 
   if (state.active && state.active.runtimeId && state.active.runtimeId !== runtimeId) {
     atomicWriteJson(paths.previous, state.active)
@@ -459,7 +494,7 @@ function markRuntimeHealthy(options) {
   atomicWriteJson(paths.active, { runtimeId, activatedAt: new Date().toISOString() })
   try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
   log.info(`[runtime] activated ${runtimeId}`)
-  return { runtimeId, runtimeDir }
+  return { runtimeId, runtimeDir: rt.runtimeDir }
 }
 
 /**
@@ -474,23 +509,25 @@ function rollbackRuntime(options) {
   const state = readState(paths)
 
   if (state.previous && state.previous.runtimeId) {
-    atomicWriteJson(paths.active, state.previous)
-    try { fs.unlinkSync(paths.previous) } catch (e) { /* ignore */ }
-    try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
-    const dir = path.join(paths.runtimes, state.previous.runtimeId)
-    const complete = readJson(path.join(dir, COMPLETE_FILE))
-    log.warn(`[runtime] rolled back to ${state.previous.runtimeId}`)
-    return { runtimeId: state.previous.runtimeId, runtimeDir: dir, entry: complete && complete.entry }
+    try {
+      const prev = resolveReadyRuntime(runtimeRoot, state.previous.runtimeId)
+      atomicWriteJson(paths.active, state.previous)
+      try { fs.unlinkSync(paths.previous) } catch (e) { /* ignore */ }
+      try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
+      log.warn(`[runtime] rolled back to ${prev.runtimeId}`)
+      return { runtimeId: prev.runtimeId, runtimeDir: prev.runtimeDir, entry: prev.complete.entry }
+    } catch (e) {
+      log.warn(`[runtime] previous runtime not usable, falling back to active: ${e.message}`)
+    }
   }
 
-  // no previous: drop pending and fall back to whatever active remains
+  // no usable previous: drop pending and fall back to whatever active remains
   try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
   if (state.active && state.active.runtimeId) {
-    const dir = path.join(paths.runtimes, state.active.runtimeId)
-    if (isReadyRuntime(dir)) {
-      const complete = readJson(path.join(dir, COMPLETE_FILE))
-      return { runtimeId: state.active.runtimeId, runtimeDir: dir, entry: complete && complete.entry }
-    }
+    try {
+      const rt = resolveReadyRuntime(runtimeRoot, state.active.runtimeId)
+      return { runtimeId: rt.runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
+    } catch (e) { /* ignore */ }
   }
   return null
 }

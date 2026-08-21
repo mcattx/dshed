@@ -157,16 +157,21 @@ async function startEngineWithRuntime({ nodeBin, runtimeRoot, dshHome }) {
   try {
     engine = createEngine(nodeBin, path.join(rt.runtimeDir, rt.entry), dshHome)
     const port = await engine.start()
-    markRuntimeHealthy({ runtimeRoot, runtimeId: rt.runtimeId, logger })
+    // only a freshly-pending runtime needs to be promoted to active; an already
+    // active runtime is simply re-started in place.
+    if (rt.needsActivation) {
+      markRuntimeHealthy({ runtimeRoot, runtimeId: rt.runtimeId, logger })
+    }
     return port
   } catch (err) {
     logger.error(`[dshed] runtime ${rt.runtimeId} failed to start, rolling back: ${err.message}`)
     if (engine) await engine.stop().catch(() => {})
     const prev = rollbackRuntime({ runtimeRoot, logger })
     if (!prev) throw err
+    // rollbackRuntime already restored `prev` as active; just start it (no
+    // re-activation needed — it is the last known-good runtime).
     engine = createEngine(nodeBin, path.join(prev.runtimeDir, prev.entry), dshHome)
     const port = await engine.start()
-    markRuntimeHealthy({ runtimeRoot, runtimeId: prev.runtimeId, logger })
     logger.info(`[dshed] rolled back to ${prev.runtimeId}`)
     return port
   }
@@ -176,7 +181,7 @@ async function startEngineWithRuntime({ nodeBin, runtimeRoot, dshHome }) {
 async function resolveRuntime({ runtimeRoot, nodeBin }) {
   const active = getActiveRuntime({ runtimeRoot, logger })
   if (active) {
-    return { runtimeId: active.runtimeId, runtimeDir: active.runtimeDir, entry: active.entry }
+    return { runtimeId: active.runtimeId, runtimeDir: active.runtimeDir, entry: active.entry, needsActivation: false }
   }
   const base = resourceBase()
   const manifestPath = path.join(base, 'dsh-runtimes', 'dsh-runtime-manifest.json')
@@ -186,7 +191,7 @@ async function resolveRuntime({ runtimeRoot, nodeBin }) {
     runtimeRoot, manifest, archivePath, platform: process.platform, arch: process.arch, logger,
   })
   const pending = activateRuntime({ runtimeRoot, runtimeId: installed.runtimeId, logger })
-  return { runtimeId: pending.runtimeId, runtimeDir: pending.runtimeDir, entry: pending.entry }
+  return { runtimeId: pending.runtimeId, runtimeDir: pending.runtimeDir, entry: pending.entry, needsActivation: true }
 }
 
 /** Build an EngineManager with explicit paths and wire crash/restart events */

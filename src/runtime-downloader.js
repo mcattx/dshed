@@ -164,10 +164,31 @@ function writeResponseToPart(res, partPath, startFrom, expectedSize, { signal, i
   })
 }
 
-function retryableError(err) {
-  // size/sha256 mismatch and non-HTTP errors are not retried; transient network
-  // and stream errors are.
+function isAbortError(err, signal) {
+  return (signal && signal.aborted) || /aborted|abort/i.test(err && err.message)
+}
+
+function retryableError(err, signal) {
+  // cancellation must never be retried; size/sha256 mismatch, over-size and
+  // trust violations are fatal too. Only transient network/stream errors retry.
+  if (isAbortError(err, signal)) return false
   return !/size mismatch|sha256 mismatch|exceeds expected size|not allowed|forbidden/i.test(err.message)
+}
+
+/** fileName must be a single safe basename (no separators, no `..`, no NUL) */
+function assertSafeFileName(fileName) {
+  if (typeof fileName !== 'string' || fileName.length === 0) throw new Error('invalid fileName')
+  if (fileName.indexOf('\0') !== -1) throw new Error('fileName must not contain NUL')
+  if (fileName.indexOf('/') !== -1 || fileName.indexOf('\\') !== -1) throw new Error('fileName must not contain path separators')
+  if (fileName === '.' || fileName === '..' || fileName.includes('..')) throw new Error('fileName must not contain `..`')
+  return fileName
+}
+
+/** assert child resolves inside parent (blocks traversal out of destDir) */
+function assertInside(parent, child) {
+  const p = path.resolve(parent)
+  const c = path.resolve(child)
+  if (c !== p && !c.startsWith(p + path.sep)) throw new Error(`path escapes destDir: ${child}`)
 }
 
 /**
@@ -184,11 +205,15 @@ async function download(options) {
     maxRetries = DEFAULT_MAX_RETRIES,
   } = options
   const log = logger || { info: () => {}, warn: () => {}, error: () => {} }
+  assertSafeFileName(fileName)
   fs.mkdirSync(destDir, { recursive: true })
 
   const partPath = path.join(destDir, `${fileName}.part`)
   const metaPath = path.join(destDir, `${fileName}.part.meta`)
   const finalPath = path.join(destDir, fileName)
+  assertInside(destDir, partPath)
+  assertInside(destDir, metaPath)
+  assertInside(destDir, finalPath)
 
   // already downloaded + verified
   if (fs.existsSync(finalPath)) {
@@ -209,7 +234,7 @@ async function download(options) {
       })
       return r
     } catch (err) {
-      if (retryableError(err) && attempt < maxRetries) {
+      if (retryableError(err, signal) && attempt < maxRetries) {
         const backoff = Math.min(2000 * Math.pow(2, attempt), 8000)
         log.warn(`[downloader] attempt ${attempt + 1} failed (${err.message}), retrying in ${backoff}ms`)
         await sleep(backoff)
@@ -246,10 +271,7 @@ async function downloadAttempt(opts) {
     else if (meta && meta.lastModified) headers['If-Range'] = meta.lastModified
   }
 
-  const res = await withConnectTimeout(
-    transport.request(url, { headers, signal }),
-    connectTimeout,
-  )
+  const res = await requestWithConnectTimeout(transport, url, headers, signal, connectTimeout)
 
   // 416: range not satisfiable — if we already have the whole file, it is done
   if (res.statusCode === 416) {
@@ -319,11 +341,54 @@ async function verifyAndFinalize(partPath, finalPath, fileName, expectedSize, ex
   return { filePath: finalPath, size, sha256: digest }
 }
 
-function withConnectTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error('connect timeout')), ms)),
-  ])
+/** compose a user signal with a locally-abortable signal */
+function createCancellableSignal(userSignal) {
+  let aborted = false
+  const listeners = new Set()
+  const signal = {
+    get aborted() { return aborted },
+    addEventListener(type, fn) { if (type === 'abort') listeners.add(fn) },
+    removeEventListener(type, fn) { if (type === 'abort') listeners.delete(fn) },
+    abort() { if (!aborted) { aborted = true; for (const fn of listeners) fn() } },
+  }
+  if (userSignal) {
+    if (userSignal.aborted) signal.abort()
+    else userSignal.addEventListener('abort', () => signal.abort())
+  }
+  return signal
+}
+
+/**
+ * Request with a connect timeout that actually cancels the underlying request:
+ * on timeout it aborts the composed signal (destroying the socket/stream) and
+ * only then rejects, so no half-open request survives into the retry loop.
+ */
+function requestWithConnectTimeout(transport, url, headers, userSignal, connectTimeout) {
+  const signal = createCancellableSignal(userSignal)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      signal.abort() // destroy the in-flight request
+      reject(new Error('connect timeout'))
+    }, connectTimeout)
+
+    transport.request(url, { headers, signal }).then(
+      (res) => {
+        if (settled) { if (res && res.stream) res.stream.destroy(); return }
+        settled = true
+        clearTimeout(timer)
+        resolve(res)
+      },
+      (err) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 }
 
 module.exports = {

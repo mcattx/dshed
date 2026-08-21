@@ -240,6 +240,27 @@ async function main() {
     server.close()
   }
 
+  console.log('\n[9b] cancellation is immediate (no retry/backoff)')
+  {
+    let requestCount = 0
+    const signal = makeAbortSignal()
+    const { server, content, url } = await createServer({ onRequest: () => { requestCount += 1; if (requestCount === 1) signal.abort() } })
+    const dir = tmpdir('cancel-fast')
+    const start = Date.now()
+    let threw = false
+    try {
+      await download({
+        url, destDir: dir, fileName: 'a.tar.gz',
+        expectedSize: content.length, expectedSha256: sha256(content), transport: httpTransport, signal,
+      })
+    } catch (e) { threw = true }
+    const elapsed = Date.now() - start
+    ok(threw, 'cancelled download throws')
+    ok(elapsed < 500, `cancellation is immediate (${elapsed}ms < 500ms)`)
+    ok(requestCount === 1, `only one request sent (${requestCount})`)
+    server.close()
+  }
+
   console.log('\n[10] over-size content rejected')
   {
     const { server, content, url } = await createServer()
@@ -255,11 +276,57 @@ async function main() {
     server.close()
   }
 
+  console.log('\n[10b] connect timeout cancels the underlying request')
+  {
+    let connections = 0
+    let closed = 0
+    const server = http.createServer(() => { /* accept but never respond */ })
+    server.on('connection', (socket) => { connections += 1; socket.on('close', () => { closed += 1 }) })
+    await new Promise((r) => server.listen(0, '127.0.0.1', r))
+    const url = `http://127.0.0.1:${server.address().port}/file`
+
+    const dir = tmpdir('connect-timeout')
+    let threw = false
+    const start = Date.now()
+    try {
+      await download({
+        url, destDir: dir, fileName: 'a.tar.gz',
+        expectedSize: 100, expectedSha256: sha256(Buffer.from('x')),
+        transport: httpTransport, connectTimeout: 50, maxRetries: 0,
+      })
+    } catch (e) { threw = true }
+    const elapsed = Date.now() - start
+    ok(threw, 'connect timeout throws')
+    ok(elapsed < 2000, `connect timeout rejects promptly (${elapsed}ms)`)
+
+    // the underlying socket must be closed, not left half-open
+    await new Promise((r) => setTimeout(r, 50))
+    ok(closed >= connections, `underlying request closed (${closed}/${connections})`)
+    server.close()
+  }
+
   console.log('\n[11] parseContentRange')
   {
     const c = parseContentRange('bytes 100-199/1000')
     ok(c && c.start === 100 && c.end === 199 && c.total === 1000, 'parses Content-Range')
     ok(parseContentRange('garbage') === null, 'rejects malformed Content-Range')
+  }
+
+  console.log('\n[12] unsafe fileName rejected')
+  {
+    const { server, content, url } = await createServer()
+    const dir = tmpdir('unsafe-name')
+    for (const name of ['../../escape', 'a/b', 'a\\b', '..', '']) {
+      let threw = false
+      try {
+        await download({
+          url, destDir: dir, fileName: name,
+          expectedSize: content.length, expectedSha256: sha256(content), transport: httpTransport,
+        })
+      } catch (e) { threw = true }
+      ok(threw, `fileName ${JSON.stringify(name)} rejected`)
+    }
+    server.close()
   }
 
   console.log(`\n=== result: ${passed} passed, ${failed} failed ===`)

@@ -100,7 +100,7 @@ if (!gotLock) {
     if (process.argv.includes('--purge-engine-cache')) {
       initLogFile()
       const runtimeRoot = path.join(app.getPath('userData'), 'dsh-runtimes')
-      purgeRuntimeCache({ runtimeRoot, logger })
+      await purgeRuntimeCache({ runtimeRoot, logger })
       logger.info('[dshed] engine cache purged')
       app.exit(0)
       return
@@ -361,7 +361,25 @@ function showFatalError(err) {
   if (win && !win.isDestroyed()) {
     win.loadFile(path.join(__dirname, 'assets', 'error.html'), { query: { reason: encodeURIComponent(err.message), lang: pageLang() } })
     win.show()
+    return
   }
+  // startup failed before the main window existed (e.g. archive missing,
+  // extraction failed, or both runtimes failed to start): create a minimal
+  // error window so the user is not left with a silent, invisible failure.
+  win = new BrowserWindow({
+    width: 720,
+    height: 520,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  win.loadFile(path.join(__dirname, 'assets', 'error.html'), { query: { reason: encodeURIComponent(err.message), lang: pageLang() } })
+  win.once('ready-to-show', () => win.show())
+  win.on('closed', () => { win = null })
 }
 
 async function shutdown() {

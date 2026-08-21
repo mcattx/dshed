@@ -45,11 +45,50 @@ function isSafeRelativePath(p) {
   return true
 }
 
+// a single, safe directory-name component: no separators, no traversal, no NUL
+const SAFE_DIRNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/
+
+/** validate a runtimeId / buildId is a safe single directory-name component */
+function isSafeDirName(name) {
+  return typeof name === 'string' && SAFE_DIRNAME_RE.test(name)
+}
+
+const VALID_PLATFORMS = ['darwin', 'win32', 'linux']
+const VALID_ARCHS = ['x64', 'arm64']
+
 /** minimal semver comparison (major.minor.patch with optional prerelease) */
 function parseVersion(v) {
   const m = String(v).trim().match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/)
   if (!m) return null
   return { major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] || '' }
+}
+
+/** SemVer prerelease comparison: dot-separated identifiers, numeric vs numeric, numeric < alphanumeric */
+function comparePrerelease(a, b) {
+  if (a === b) return 0
+  if (a === '') return 1 // release > prerelease
+  if (b === '') return -1
+  const as = a.split('.')
+  const bs = b.split('.')
+  const len = Math.max(as.length, bs.length)
+  for (let i = 0; i < len; i++) {
+    const x = as[i]
+    const y = bs[i]
+    if (x === undefined) return -1
+    if (y === undefined) return 1
+    const xNum = /^\d+$/.test(x)
+    const yNum = /^\d+$/.test(y)
+    if (xNum && yNum) {
+      const nx = parseInt(x, 10)
+      const ny = parseInt(y, 10)
+      if (nx !== ny) return nx < ny ? -1 : 1
+    } else if (xNum !== yNum) {
+      return xNum ? -1 : 1 // numeric identifiers sort before alphanumeric
+    } else if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return 0
 }
 
 function compareVersions(a, b) {
@@ -59,10 +98,7 @@ function compareVersions(a, b) {
   for (const k of ['major', 'minor', 'patch']) {
     if (pa[k] !== pb[k]) return pa[k] < pb[k] ? -1 : 1
   }
-  if (pa.pre === pb.pre) return 0
-  if (pa.pre === '') return 1 // release > prerelease
-  if (pb.pre === '') return -1
-  return pa.pre < pb.pre ? -1 : 1
+  return comparePrerelease(pa.pre, pb.pre)
 }
 
 function sha256File(filePath) {
@@ -168,6 +204,19 @@ function validateManifest(manifest, context = {}) {
     if (!manifest.runtimeId.includes(manifest.buildId)) add('runtimeId must contain buildId')
   }
 
+  if (typeof manifest.runtimeId === 'string' && !isSafeDirName(manifest.runtimeId)) {
+    add(`runtimeId is not a safe directory name: ${manifest.runtimeId}`)
+  }
+  if (typeof manifest.buildId === 'string' && !isSafeDirName(manifest.buildId)) {
+    add(`buildId is not a safe identifier: ${manifest.buildId}`)
+  }
+  if (typeof manifest.platform === 'string' && !VALID_PLATFORMS.includes(manifest.platform)) {
+    add(`invalid platform: ${manifest.platform}`)
+  }
+  if (typeof manifest.arch === 'string' && !VALID_ARCHS.includes(manifest.arch)) {
+    add(`invalid arch: ${manifest.arch}`)
+  }
+
   if (platform && manifest.platform !== platform) add(`platform mismatch: manifest=${manifest.platform} host=${platform}`)
   if (arch && manifest.arch !== arch) add(`arch mismatch: manifest=${manifest.arch} host=${arch}`)
 
@@ -200,8 +249,42 @@ function runtimePaths(runtimeRoot) {
   }
 }
 
+/** defensive guard: assert `child` resolves inside `parent` (blocks traversal) */
+function assertInside(parent, child) {
+  const p = path.resolve(parent)
+  const c = path.resolve(child)
+  if (c !== p && !c.startsWith(p + path.sep)) {
+    throw new Error(`path escapes root: ${child} is outside ${parent}`)
+  }
+}
+
+/**
+ * Read and validate complete.json. Returns the parsed object, or null when
+ * missing/corrupt/old-format. A runtime is only "ready" when its identity
+ * fields are all present and well-formed.
+ */
+function readComplete(runtimeDir) {
+  const complete = readJson(path.join(runtimeDir, COMPLETE_FILE))
+  if (!isObject(complete)) return null
+  if (complete.formatVersion !== 1) return null
+  if (typeof complete.runtimeId !== 'string' || !isSafeDirName(complete.runtimeId)) return null
+  if (typeof complete.buildId !== 'string' || !isSafeDirName(complete.buildId)) return null
+  if (typeof complete.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(complete.sha256)) return null
+  if (typeof complete.entry !== 'string' || !isSafeRelativePath(complete.entry)) return null
+  if (complete.healthy !== undefined && typeof complete.healthy !== 'boolean') return null
+  return complete
+}
+
 function isReadyRuntime(runtimeDir) {
-  return isObject(readJson(path.join(runtimeDir, COMPLETE_FILE)))
+  return readComplete(runtimeDir) !== null
+}
+
+/** true when a complete.json identity matches the manifest being installed */
+function completeMatches(complete, manifest) {
+  return complete
+    && complete.runtimeId === manifest.runtimeId
+    && complete.buildId === manifest.buildId
+    && complete.sha256 === manifest.sha256
 }
 
 // ————————————————————————————————— ensure ————————————————————————————————————
@@ -220,7 +303,10 @@ async function ensureRuntime(options) {
   if (!check.valid) throw new Error(`invalid manifest: ${check.errors.join('; ')}`)
 
   const runtimeDir = path.join(paths.runtimes, manifest.runtimeId)
-  if (isReadyRuntime(runtimeDir)) {
+  assertInside(paths.runtimes, runtimeDir)
+
+  // fast path (no lock): already installed with a matching identity
+  if (completeMatches(readComplete(runtimeDir), manifest)) {
     log.info(`[runtime] ${manifest.runtimeId} already ready, skipping install`)
     return { runtimeId: manifest.runtimeId, runtimeDir }
   }
@@ -239,7 +325,20 @@ async function ensureRuntime(options) {
 
   const release = await acquireLock(paths.lock, { logger: log })
   try {
+    // re-check under the lock: another process may have installed while we
+    // waited on it. Return if the identity now matches; refuse to overwrite a
+    // mismatched (corrupt/conflicting) runtime.
+    const existing = readComplete(runtimeDir)
+    if (completeMatches(existing, manifest)) {
+      log.info(`[runtime] ${manifest.runtimeId} installed by another process, skipping`)
+      return { runtimeId: manifest.runtimeId, runtimeDir }
+    }
+    if (existing) {
+      throw new Error(`runtime ${manifest.runtimeId} exists with mismatched identity (buildId=${existing.buildId}, sha256=${existing.sha256})`)
+    }
+
     const stagingDir = path.join(paths.staging, manifest.runtimeId)
+    assertInside(paths.staging, stagingDir)
     fs.rmSync(stagingDir, { recursive: true, force: true })
     fs.mkdirSync(stagingDir, { recursive: true })
 
@@ -399,33 +498,42 @@ function rollbackRuntime(options) {
 // ————————————————————————————————— purge ————————————————————————————————————
 
 /**
- * Purge install caches only: downloads, staging and non-active runtimes. The
- * active runtime and user data (sessions/settings/credentials/logs, which live
- * outside dsh-runtimes) are never touched.
+ * Purge install caches only: downloads, staging and non-active/non-pending
+ * runtimes. The active, previous and pending runtimes and all user data
+ * (sessions/settings/credentials/logs, which live outside dsh-runtimes) are
+ * never touched. Takes the install lock so it never races an in-flight install
+ * or a pending activation.
  */
-function purgeRuntimeCache(options) {
+async function purgeRuntimeCache(options) {
   const { runtimeRoot, logger } = options
   const log = logger || { info: () => {}, warn: () => {} }
   const paths = runtimePaths(runtimeRoot)
-  const state = readState(paths)
 
-  const keep = new Set()
-  if (state.active && state.active.runtimeId) keep.add(state.active.runtimeId)
-  if (state.previous && state.previous.runtimeId) keep.add(state.previous.runtimeId)
+  const release = await acquireLock(paths.lock, { logger: log })
+  try {
+    const state = readState(paths)
 
-  fs.rmSync(paths.downloads, { recursive: true, force: true })
-  fs.rmSync(paths.staging, { recursive: true, force: true })
+    const keep = new Set()
+    if (state.active && state.active.runtimeId) keep.add(state.active.runtimeId)
+    if (state.previous && state.previous.runtimeId) keep.add(state.previous.runtimeId)
+    if (state.pending && state.pending.runtimeId) keep.add(state.pending.runtimeId)
 
-  if (fs.existsSync(paths.runtimes)) {
-    for (const name of fs.readdirSync(paths.runtimes)) {
-      if (!keep.has(name)) {
-        log.info(`[runtime] purging runtime ${name}`)
-        fs.rmSync(path.join(paths.runtimes, name), { recursive: true, force: true })
+    fs.rmSync(paths.downloads, { recursive: true, force: true })
+    fs.rmSync(paths.staging, { recursive: true, force: true })
+
+    if (fs.existsSync(paths.runtimes)) {
+      for (const name of fs.readdirSync(paths.runtimes)) {
+        if (!keep.has(name)) {
+          log.info(`[runtime] purging runtime ${name}`)
+          fs.rmSync(path.join(paths.runtimes, name), { recursive: true, force: true })
+        }
       }
     }
-  }
 
-  return { kept: [...keep] }
+    return { kept: [...keep] }
+  } finally {
+    release()
+  }
 }
 
 module.exports = {
@@ -439,5 +547,6 @@ module.exports = {
   acquireLock,
   compareVersions,
   isSafeRelativePath,
+  isSafeDirName,
   runtimePaths,
 }

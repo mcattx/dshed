@@ -9,14 +9,14 @@
  *   runtimes/<runtime-id>/   installed runtimes (complete.json marks readiness)
  *   staging/                 in-progress extraction
  *   downloads/               cached archives (used by the delivery layer later)
- *   active.json              currently active runtime
- *   previous.json            last known-good runtime (rollback target)
- *   pending.json             runtime being activated (pending health check)
+ *   runtime-state.json       single versioned state file (active/previous/
+ *                            pending/failed/lastUpdateError/channel/pinned)
  *   install.lock             cross-process install lock
  *
- * All JSON state files are written via temp-file + atomic rename. The active
- * runtime is never overwritten in place — a new runtime is staged then renamed
- * into its own versioned directory.
+ * All JSON state files are written via temp-file + fsync + atomic rename. The
+ * active runtime is never overwritten in place — a new runtime is staged then
+ * renamed into its own versioned directory. `active` changes only through
+ * commitActivation/commitRollback, both after a successful health check.
  */
 
 const fs = require('node:fs')
@@ -29,6 +29,8 @@ const ACTIVE_FILE = 'active.json'
 const PREVIOUS_FILE = 'previous.json'
 const PENDING_FILE = 'pending.json'
 const COMPLETE_FILE = 'complete.json'
+const STATE_FILE = 'runtime-state.json'
+const STATE_SCHEMA_VERSION = 2
 
 // ————————————————————————————————— util ————————————————————————————————————
 
@@ -115,7 +117,13 @@ function atomicWriteJson(filePath, obj) {
   const dir = path.dirname(filePath)
   fs.mkdirSync(dir, { recursive: true })
   const tmp = path.join(dir, `.${path.basename(filePath)}.tmp-${process.pid}-${Date.now()}`)
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2))
+  const fd = fs.openSync(tmp, 'w')
+  try {
+    fs.writeSync(fd, JSON.stringify(obj, null, 2))
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
   fs.renameSync(tmp, filePath)
 }
 
@@ -242,6 +250,7 @@ function runtimePaths(runtimeRoot) {
     runtimes: path.join(runtimeRoot, 'runtimes'),
     staging: path.join(runtimeRoot, 'staging'),
     downloads: path.join(runtimeRoot, 'downloads'),
+    state: path.join(runtimeRoot, STATE_FILE),
     active: path.join(runtimeRoot, ACTIVE_FILE),
     previous: path.join(runtimeRoot, PREVIOUS_FILE),
     pending: path.join(runtimeRoot, PENDING_FILE),
@@ -298,7 +307,7 @@ function resolveReadyRuntime(runtimeRoot, runtimeId) {
   assertInside(paths.runtimes, runtimeDir)
   const complete = readComplete(runtimeDir)
   if (!complete) throw new Error(`runtime not ready: ${runtimeId}`)
-  return { runtimeId, runtimeDir, complete }
+  return { runtimeId, runtimeDir, complete, entry: complete.entry }
 }
 
 // ————————————————————————————————— ensure ————————————————————————————————————
@@ -411,125 +420,244 @@ async function ensureRuntime(options) {
 
 // ————————————————————————————————— active/activate/rollback ——————————————————
 
-function readState(paths) {
+function defaultState() {
   return {
-    active: readJson(paths.active),
-    previous: readJson(paths.previous),
-    pending: readJson(paths.pending),
+    schemaVersion: STATE_SCHEMA_VERSION,
+    active: null,
+    previous: null,
+    pending: null,
+    failed: null,
+    lastUpdateError: null,
+    channel: 'stable',
+    pinned: null,
+    updatedAt: null,
   }
 }
 
-/**
- * Resolve the current active runtime. Cleans up a stale pending marker (an
- * interrupted activation must not block startup) and returns the runtime dir
- * plus manifest, or null when nothing is installed yet.
- */
-function getActiveRuntime(options) {
-  const { runtimeRoot, logger } = options
-  const log = logger || { info: () => {}, warn: () => {} }
-  const paths = runtimePaths(runtimeRoot)
-  const state = readState(paths)
-
-  if (state.pending) {
-    log.warn(`[runtime] clearing stale pending runtime ${state.pending.runtimeId}`)
-    try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
-  }
-
-  if (state.active && state.active.runtimeId) {
-    try {
-      const rt = resolveReadyRuntime(runtimeRoot, state.active.runtimeId)
-      return { runtimeId: rt.runtimeId, runtimeDir: rt.runtimeDir, manifest: state.active, entry: rt.complete.entry }
-    } catch (e) {
-      log.warn(`[runtime] active runtime not usable: ${e.message}`)
+/** normalize a parsed runtime-state.json into a well-formed state object */
+function normalizeState(raw) {
+  const s = defaultState()
+  if (!isObject(raw)) return s
+  if (raw.schemaVersion !== STATE_SCHEMA_VERSION) return s
+  for (const key of ['active', 'previous']) {
+    if (isObject(raw[key]) && typeof raw[key].runtimeId === 'string' && raw[key].runtimeId.length > 0) {
+      s[key] = { runtimeId: raw[key].runtimeId, activatedAt: raw[key].activatedAt || null }
     }
   }
-  return null
+  if (isObject(raw.pending) && typeof raw.pending.runtimeId === 'string' && raw.pending.runtimeId.length > 0) {
+    s.pending = {
+      runtimeId: raw.pending.runtimeId,
+      attemptCount: typeof raw.pending.attemptCount === 'number' ? raw.pending.attemptCount : 0,
+      lastAttemptAt: raw.pending.lastAttemptAt || null,
+      failureReason: raw.pending.failureReason || null,
+    }
+  }
+  if (isObject(raw.failed) && typeof raw.failed.runtimeId === 'string' && raw.failed.runtimeId.length > 0) {
+    s.failed = { runtimeId: raw.failed.runtimeId, failureReason: raw.failed.failureReason || null, failedAt: raw.failed.failedAt || null }
+  }
+  if (isObject(raw.lastUpdateError)) {
+    s.lastUpdateError = { stage: raw.lastUpdateError.stage || null, message: raw.lastUpdateError.message || null, at: raw.lastUpdateError.at || null }
+  }
+  if (['stable', 'manual', 'preview', 'pinned'].includes(raw.channel)) s.channel = raw.channel
+  if (isObject(raw.pinned) && typeof raw.pinned.runtimeId === 'string') s.pinned = { runtimeId: raw.pinned.runtimeId }
+  s.updatedAt = raw.updatedAt || null
+  return s
+}
+
+/** write the state file atomically, stamping updatedAt */
+function writeState(paths, state) {
+  state.updatedAt = new Date().toISOString()
+  atomicWriteJson(paths.state, state)
 }
 
 /**
- * Mark a ready runtime as the pending activation target (atomic). Returns the
- * runtime dir + entry so the caller can start it and health-check it.
+ * Read the current runtime state. Pure read — no migration, no pending cleanup,
+ * no side effects. Returns a fully-normalized state object (defaults filled).
  */
-function activateRuntime(options) {
-  const { runtimeRoot, runtimeId, logger } = options
-  const log = logger || { info: () => {}, warn: () => {}, error: () => {} }
+function readRuntimeState({ runtimeRoot } = {}) {
+  const paths = runtimePaths(runtimeRoot)
+  return normalizeState(readJson(paths.state))
+}
+
+/**
+ * One-time migration from Plan 1's three files (active/previous/pending.json)
+ * into the single runtime-state.json. Writes the new file first, then removes
+ * the old files only after a successful fsync + rename. On any failure the old
+ * files and all runtime dirs are preserved.
+ */
+function migrateLegacyState({ runtimeRoot, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
+  const paths = runtimePaths(runtimeRoot)
+  if (fs.existsSync(paths.state)) return false
+
+  const hasLegacy = fs.existsSync(paths.active) || fs.existsSync(paths.previous) || fs.existsSync(paths.pending)
+  if (!hasLegacy) return false
+
+  const state = defaultState()
+  const active = readJson(paths.active)
+  const previous = readJson(paths.previous)
+  const pending = readJson(paths.pending)
+  if (isObject(active) && typeof active.runtimeId === 'string' && active.runtimeId.length > 0) {
+    state.active = { runtimeId: active.runtimeId, activatedAt: active.activatedAt || null }
+  }
+  if (isObject(previous) && typeof previous.runtimeId === 'string' && previous.runtimeId.length > 0) {
+    state.previous = { runtimeId: previous.runtimeId, activatedAt: previous.activatedAt || null }
+  }
+  if (isObject(pending) && typeof pending.runtimeId === 'string' && pending.runtimeId.length > 0) {
+    state.pending = { runtimeId: pending.runtimeId, attemptCount: 0, lastAttemptAt: null, failureReason: null }
+  }
+
+  // write new first, then delete old — never destroy the recovery source
+  atomicWriteJson(paths.state, state)
+  for (const p of [paths.active, paths.previous, paths.pending]) {
+    try { fs.unlinkSync(p) } catch (e) { /* ignore */ }
+  }
+  log.info('[runtime] migrated legacy state files → runtime-state.json')
+  return true
+}
+
+/**
+ * Idempotent recovery of interrupted transitions, run early at startup. Only
+ * normalizes; does not make a startup decision. A pending pointing at a missing
+ * or non-ready runtime dir is moved into `failed`.
+ */
+function recoverInterruptedTransition({ runtimeRoot, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
+  const paths = runtimePaths(runtimeRoot)
+  const state = readRuntimeState({ runtimeRoot })
+
+  if (state.pending && state.pending.runtimeId) {
+    let ready = false
+    try { resolveReadyRuntime(runtimeRoot, state.pending.runtimeId); ready = true } catch (e) { /* not ready */ }
+    if (!ready) {
+      const runtimeId = state.pending.runtimeId
+      state.failed = { runtimeId, failureReason: 'pending runtime dir missing or not ready', failedAt: new Date().toISOString() }
+      state.pending = null
+      writeState(paths, state)
+      log.warn(`[runtime] pending runtime ${runtimeId} missing/not ready → failed`)
+    }
+  }
+  return state
+}
+
+/**
+ * Return ready startup candidates by role: pending (first), then active, then
+ * previous. Read-only; a non-ready runtime is reported as null.
+ */
+function selectStartupCandidate({ runtimeRoot } = {}) {
+  const state = readRuntimeState({ runtimeRoot })
+  const ready = (runtimeId) => {
+    if (!runtimeId) return null
+    try { resolveReadyRuntime(runtimeRoot, runtimeId); return runtimeId } catch (e) { return null }
+  }
+  return {
+    pending: ready(state.pending && state.pending.runtimeId),
+    active: ready(state.active && state.active.runtimeId),
+    previous: ready(state.previous && state.previous.runtimeId),
+  }
+}
+
+/**
+ * Mark a ready runtime as the pending activation target (atomic). Increments
+ * attemptCount when re-attempting the same runtime. Does not touch active.
+ */
+function beginActivation({ runtimeRoot, runtimeId, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
   const paths = runtimePaths(runtimeRoot)
   const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
+  const state = readRuntimeState({ runtimeRoot })
 
-  atomicWriteJson(paths.pending, { runtimeId, pendingAt: new Date().toISOString() })
-  log.info(`[runtime] pending activation: ${runtimeId}`)
+  const prevAttempt = (state.pending && state.pending.runtimeId === runtimeId) ? state.pending.attemptCount : 0
+  state.pending = { runtimeId, attemptCount: prevAttempt + 1, lastAttemptAt: new Date().toISOString(), failureReason: null }
+  writeState(paths, state)
+  log.info(`[runtime] pending activation: ${runtimeId} (attempt ${state.pending.attemptCount})`)
   return { runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
 }
 
 /**
- * Called after a pending runtime passes its health check: promote it to active
- * and preserve the previous active as the rollback target. Atomic.
+ * Promote a pending runtime to active after a successful health check. Moves
+ * the previous active to `previous`. Requires a matching pending marker; this
+ * is the only way (besides commitRollback) that `active` changes.
  */
-function markRuntimeHealthy(options) {
-  const { runtimeRoot, runtimeId, logger } = options
+function commitActivation({ runtimeRoot, runtimeId, logger } = {}) {
   const log = logger || { info: () => {}, warn: () => {} }
   const paths = runtimePaths(runtimeRoot)
-  const state = readState(paths)
-
-  // reject invalid/not-ready runtimes — never write active.json for one
   const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
+  const state = readRuntimeState({ runtimeRoot })
 
-  // activation must be driven by a matching pending marker
   if (!state.pending || state.pending.runtimeId !== runtimeId) {
     throw new Error(`runtime ${runtimeId} is not pending activation`)
   }
-
-  // entry must actually exist inside the runtime dir
   const entryAbs = path.resolve(rt.runtimeDir, rt.complete.entry)
   assertInside(rt.runtimeDir, entryAbs)
-  if (!fs.existsSync(entryAbs)) {
-    throw new Error(`runtime entry not found: ${rt.complete.entry}`)
-  }
+  if (!fs.existsSync(entryAbs)) throw new Error(`runtime entry not found: ${rt.complete.entry}`)
 
   atomicWriteJson(path.join(rt.runtimeDir, COMPLETE_FILE), { ...rt.complete, healthy: true })
 
   if (state.active && state.active.runtimeId && state.active.runtimeId !== runtimeId) {
-    atomicWriteJson(paths.previous, state.active)
+    state.previous = state.active
   }
-  atomicWriteJson(paths.active, { runtimeId, activatedAt: new Date().toISOString() })
-  try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
+  state.active = { runtimeId, activatedAt: new Date().toISOString() }
+  state.pending = null
+  writeState(paths, state)
   log.info(`[runtime] activated ${runtimeId}`)
   return { runtimeId, runtimeDir: rt.runtimeDir }
 }
 
 /**
- * Roll back to the previous (last known-good) runtime after a pending runtime
- * fails to start. Returns the previous runtime's info, or null when there is
- * no previous runtime to fall back to.
+ * Move a failed pending runtime into `failed`. Only `pending` is cleared; the
+ * current active is left untouched. `failed` is reserved for startup failure —
+ * download/verify/extract failures never land here.
  */
-function rollbackRuntime(options) {
-  const { runtimeRoot, logger } = options
+function failActivation({ runtimeRoot, runtimeId, reason, logger } = {}) {
   const log = logger || { info: () => {}, warn: () => {} }
   const paths = runtimePaths(runtimeRoot)
-  const state = readState(paths)
+  const state = readRuntimeState({ runtimeRoot })
 
-  if (state.previous && state.previous.runtimeId) {
-    try {
-      const prev = resolveReadyRuntime(runtimeRoot, state.previous.runtimeId)
-      atomicWriteJson(paths.active, state.previous)
-      try { fs.unlinkSync(paths.previous) } catch (e) { /* ignore */ }
-      try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
-      log.warn(`[runtime] rolled back to ${prev.runtimeId}`)
-      return { runtimeId: prev.runtimeId, runtimeDir: prev.runtimeDir, entry: prev.complete.entry }
-    } catch (e) {
-      log.warn(`[runtime] previous runtime not usable, falling back to active: ${e.message}`)
-    }
-  }
+  state.failed = { runtimeId, failureReason: reason || null, failedAt: new Date().toISOString() }
+  if (state.pending && state.pending.runtimeId === runtimeId) state.pending = null
+  writeState(paths, state)
+  log.warn(`[runtime] activation failed: ${runtimeId} (${reason || 'unknown'})`)
+  return state.failed
+}
 
-  // no usable previous: drop pending and fall back to whatever active remains
-  try { fs.unlinkSync(paths.pending) } catch (e) { /* ignore */ }
-  if (state.active && state.active.runtimeId) {
-    try {
-      const rt = resolveReadyRuntime(runtimeRoot, state.active.runtimeId)
-      return { runtimeId: rt.runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
-    } catch (e) { /* ignore */ }
+/**
+ * Promote `previous` back to `active` after it passed a health check. Requires
+ * a matching previous marker; only runs post-health-check so a failed previous
+ * leaves the current active pointer unchanged.
+ */
+function commitRollback({ runtimeRoot, runtimeId, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
+  const paths = runtimePaths(runtimeRoot)
+  const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
+  const state = readRuntimeState({ runtimeRoot })
+
+  if (!state.previous || state.previous.runtimeId !== runtimeId) {
+    throw new Error(`runtime ${runtimeId} is not previous`)
   }
-  return null
+  state.active = { runtimeId, activatedAt: new Date().toISOString() }
+  state.previous = null
+  state.pending = null
+  writeState(paths, state)
+  log.warn(`[runtime] rolled back to ${runtimeId}`)
+  return { runtimeId, runtimeDir: rt.runtimeDir }
+}
+
+/**
+ * Re-queue a failed runtime as pending (attemptCount reset to 0) for a manual
+ * retry.
+ */
+function retryFailedRuntime({ runtimeRoot, runtimeId, logger } = {}) {
+  const log = logger || { info: () => {}, warn: () => {} }
+  const paths = runtimePaths(runtimeRoot)
+  const rt = resolveReadyRuntime(runtimeRoot, runtimeId)
+  const state = readRuntimeState({ runtimeRoot })
+
+  state.pending = { runtimeId, attemptCount: 0, lastAttemptAt: null, failureReason: null }
+  state.failed = null
+  writeState(paths, state)
+  log.info(`[runtime] re-queued failed runtime ${runtimeId} for retry`)
+  return { runtimeId, runtimeDir: rt.runtimeDir, entry: rt.complete.entry }
 }
 
 // ————————————————————————————————— purge ————————————————————————————————————
@@ -548,7 +676,7 @@ async function purgeRuntimeCache(options) {
 
   const release = await acquireLock(paths.lock, { logger: log })
   try {
-    const state = readState(paths)
+    const state = readRuntimeState({ runtimeRoot })
 
     const keep = new Set()
     if (state.active && state.active.runtimeId) keep.add(state.active.runtimeId)
@@ -576,11 +704,17 @@ async function purgeRuntimeCache(options) {
 module.exports = {
   validateManifest,
   ensureRuntime,
-  getActiveRuntime,
-  activateRuntime,
-  markRuntimeHealthy,
-  rollbackRuntime,
   purgeRuntimeCache,
+  readRuntimeState,
+  migrateLegacyState,
+  recoverInterruptedTransition,
+  selectStartupCandidate,
+  beginActivation,
+  commitActivation,
+  failActivation,
+  commitRollback,
+  retryFailedRuntime,
+  resolveReadyRuntime,
   acquireLock,
   compareVersions,
   isSafeRelativePath,

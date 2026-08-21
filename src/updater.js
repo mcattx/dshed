@@ -9,7 +9,6 @@
  * Channel: GitHub Releases (publish config in electron-builder.yml).
  */
 
-const { autoUpdater } = require('electron-updater')
 const { dialog, app } = require('electron')
 const { t } = require('./i18n')
 
@@ -28,6 +27,10 @@ function initUpdater({ logger } = {}) {
   }
   if (initialized) return
   initialized = true
+
+  // lazy require: electron-updater instantiates its platform updater on the
+  // autoUpdater getter, which touches app.getVersion() before app is ready.
+  const { autoUpdater } = require('electron-updater')
 
   autoUpdater.logger = {
     info: (msg) => log.info('[updater] ' + msg),

@@ -12,6 +12,9 @@ const { AuthProxy } = require('./auth-proxy')
 const { migrateLegacyDsh, recordVersion } = require('./migration')
 const { initUpdater } = require('./updater')
 const { t, pageLang } = require('./i18n')
+const {
+  getActiveRuntime, ensureRuntime, activateRuntime, markRuntimeHealthy, rollbackRuntime, purgeRuntimeCache,
+} = require('./runtime-manager')
 
 // —— 文件日志：打包版双击启动无终端，stdout/stderr 会丢失；落盘到
 // userData/logs/main.log（mac: ~/Library/Application Support/dshed/logs，
@@ -53,6 +56,21 @@ let quitting = false
 let proxyOrigin = null
 let proxyToken = null
 
+/** bundled resource base: packaged extraResources (process.resourcesPath) or dev project resources/ */
+function resourceBase() {
+  if (process.env.HARBOR_RESOURCES) return process.env.HARBOR_RESOURCES
+  if (process.resourcesPath && fs.existsSync(path.join(process.resourcesPath, 'node'))) {
+    return process.resourcesPath
+  }
+  return path.join(__dirname, '..', 'resources')
+}
+
+/** bundled Node executable (platform-specific layout) */
+function resolveBundledNodeBin(base) {
+  if (process.platform === 'win32') return path.join(base, 'node', 'node.exe')
+  return path.join(base, 'node', 'bin', 'node')
+}
+
 const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
@@ -76,7 +94,19 @@ if (!gotLock) {
     writeLog('error', ['unhandledRejection:', String(reason)])
   })
 
-  app.whenReady().then(bootstrap).catch((err) => {
+  app.whenReady().then(async () => {
+    // standalone cache-purge invocation: clean downloads/staging/non-active
+    // runtimes only, then exit. Never touches DSH_HOME or user data.
+    if (process.argv.includes('--purge-engine-cache')) {
+      initLogFile()
+      const runtimeRoot = path.join(app.getPath('userData'), 'dsh-runtimes')
+      purgeRuntimeCache({ runtimeRoot, logger })
+      logger.info('[dshed] engine cache purged')
+      app.exit(0)
+      return
+    }
+    return bootstrap()
+  }).catch((err) => {
     logger.error('startup failed:', err)
     showFatalError(err)
   })
@@ -105,25 +135,76 @@ async function bootstrap() {
       logger.info(`[dshed] upgrade hook: ${prevVersion} → ${version} (no migrations yet)`)
     },
   })
-  engine = new EngineManager({ dshHome, logger })
-  engine.on('crash-loop', () => {
-    logger.error('[dshed] engine crash loop, showing error page')
-    if (win) win.loadFile(path.join(__dirname, 'assets', 'error.html'), { query: { reason: 'crash-loop', lang: pageLang() } })
-  })
-  engine.on('restarted', async (port) => {
-    logger.info(`[dshed] engine restarted on port ${port}, reconnecting proxy`)
-    await restartProxy(port)
-  })
-  engine.on('restart-failed', (err) => {
-    logger.error('[dshed] engine restart failed:', err.message)
-    if (win) win.loadFile(path.join(__dirname, 'assets', 'error.html'), { query: { reason: 'restart-failed', lang: pageLang() } })
-  })
 
-  const dshPort = await engine.start()
+  const runtimeRoot = path.join(userData, 'dsh-runtimes')
+  const nodeBin = resolveBundledNodeBin(resourceBase())
+  const dshPort = await startEngineWithRuntime({ nodeBin, runtimeRoot, dshHome })
+
   await startProxy(dshPort)
   createWindow()
   if (!process.env.HARBOR_E2E) createTray()
   initUpdater({ logger })
+}
+
+/**
+ * Resolve a runnable dsh runtime (active, or install the bundled local
+ * artifact on first run), start it and health-check it. A pending runtime that
+ * fails to start triggers rollback to the previous known-good runtime; if that
+ * also fails the error propagates to showFatalError.
+ */
+async function startEngineWithRuntime({ nodeBin, runtimeRoot, dshHome }) {
+  const rt = await resolveRuntime({ runtimeRoot, nodeBin })
+  try {
+    engine = createEngine(nodeBin, path.join(rt.runtimeDir, rt.entry), dshHome)
+    const port = await engine.start()
+    markRuntimeHealthy({ runtimeRoot, runtimeId: rt.runtimeId, logger })
+    return port
+  } catch (err) {
+    logger.error(`[dshed] runtime ${rt.runtimeId} failed to start, rolling back: ${err.message}`)
+    if (engine) await engine.stop().catch(() => {})
+    const prev = rollbackRuntime({ runtimeRoot, logger })
+    if (!prev) throw err
+    engine = createEngine(nodeBin, path.join(prev.runtimeDir, prev.entry), dshHome)
+    const port = await engine.start()
+    markRuntimeHealthy({ runtimeRoot, runtimeId: prev.runtimeId, logger })
+    logger.info(`[dshed] rolled back to ${prev.runtimeId}`)
+    return port
+  }
+}
+
+/** Resolve active runtime, or install the bundled local artifact on first run */
+async function resolveRuntime({ runtimeRoot, nodeBin }) {
+  const active = getActiveRuntime({ runtimeRoot, logger })
+  if (active) {
+    return { runtimeId: active.runtimeId, runtimeDir: active.runtimeDir, entry: active.entry }
+  }
+  const base = resourceBase()
+  const manifestPath = path.join(base, 'dsh-runtimes', 'dsh-runtime-manifest.json')
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  const archivePath = path.join(base, 'dsh-runtimes', manifest.archive)
+  const installed = await ensureRuntime({
+    runtimeRoot, manifest, archivePath, platform: process.platform, arch: process.arch, logger,
+  })
+  const pending = activateRuntime({ runtimeRoot, runtimeId: installed.runtimeId, logger })
+  return { runtimeId: pending.runtimeId, runtimeDir: pending.runtimeDir, entry: pending.entry }
+}
+
+/** Build an EngineManager with explicit paths and wire crash/restart events */
+function createEngine(nodeBin, dshBin, dshHome) {
+  const em = new EngineManager({ nodeBin, dshBin, dshHome, logger })
+  em.on('crash-loop', () => {
+    logger.error('[dshed] engine crash loop, showing error page')
+    if (win) win.loadFile(path.join(__dirname, 'assets', 'error.html'), { query: { reason: 'crash-loop', lang: pageLang() } })
+  })
+  em.on('restarted', async (port) => {
+    logger.info(`[dshed] engine restarted on port ${port}, reconnecting proxy`)
+    await restartProxy(port)
+  })
+  em.on('restart-failed', (err) => {
+    logger.error('[dshed] engine restart failed:', err.message)
+    if (win) win.loadFile(path.join(__dirname, 'assets', 'error.html'), { query: { reason: 'restart-failed', lang: pageLang() } })
+  })
+  return em
 }
 
 async function startProxy(dshPort) {

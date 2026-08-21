@@ -17,8 +17,10 @@ const crypto = require('node:crypto')
 const { spawn } = require('node:child_process')
 
 const {
-  validateManifest, ensureRuntime, getActiveRuntime, activateRuntime,
-  markRuntimeHealthy, rollbackRuntime, purgeRuntimeCache, acquireLock,
+  validateManifest, ensureRuntime, purgeRuntimeCache, acquireLock,
+  readRuntimeState, migrateLegacyState, recoverInterruptedTransition, selectStartupCandidate,
+  beginActivation, commitActivation, failActivation, commitRollback, retryFailedRuntime,
+  resolveReadyRuntime,
   compareVersions, isSafeRelativePath, runtimePaths,
 } = require('../src/runtime-manager')
 const { packDirectory, unpackArchive, writeHeader, writeData, writeLongName, BLOCK } = require('../src/tar-util')
@@ -335,19 +337,19 @@ async function main() {
     const root = tmpdir('corrupt')
     const { archive, manifest } = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch })
-    activateRuntime({ runtimeRoot: root, runtimeId: manifest.runtimeId })
-    markRuntimeHealthy({ runtimeRoot: root, runtimeId: manifest.runtimeId })
+    beginActivation({ runtimeRoot: root, runtimeId: manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: manifest.runtimeId })
 
     // corrupt complete.json (bad sha256) → active runtime no longer resolves as ready
     const completePath = path.join(root, 'runtimes', manifest.runtimeId, 'complete.json')
     const complete = JSON.parse(fs.readFileSync(completePath, 'utf8'))
     complete.sha256 = 'not-a-sha'
     fs.writeFileSync(completePath, JSON.stringify(complete))
-    ok(getActiveRuntime({ runtimeRoot: root }) === null, 'corrupt complete.json makes active runtime not-ready')
+    ok(selectStartupCandidate({ runtimeRoot: root }).active === null, 'corrupt complete.json makes active runtime not-ready')
 
     // old-format complete.json (missing fields) → not ready
     fs.writeFileSync(completePath, JSON.stringify({ formatVersion: 1 }))
-    ok(getActiveRuntime({ runtimeRoot: root }) === null, 'incomplete complete.json is not ready')
+    ok(selectStartupCandidate({ runtimeRoot: root }).active === null, 'incomplete complete.json is not ready')
 
     // a runtime directory with mismatched identity is refused, not overwritten
     fs.writeFileSync(completePath, JSON.stringify({ ...complete, sha256: manifest.sha256, buildId: 'deadbee' }))
@@ -446,14 +448,14 @@ async function main() {
     ok(fs.existsSync(path.join(root, 'runtimes', manifest.runtimeId, 'complete.json')), 'runtime installed exactly once')
   }
 
-  // ————————————————— [6] activate / healthy / rollback —————————————————
-  console.log('\n[6] activate / markHealthy / rollback')
+  // ————————————————— [6] activate / commit / rollback —————————————————
+  console.log('\n[6] beginActivation / commitActivation / commitRollback')
   {
     const root = tmpdir('activate')
     const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     b.manifest = makeManifest({
-      runtimeId: 'dsh-0.1.0-rc.7-beef001-beef001-beef001-beef001'.slice(0, 0) || `dsh-0.1.0-rc.7-deadbee-${process.platform}-${process.arch}`,
+      runtimeId: `dsh-0.1.0-rc.7-deadbee-${process.platform}-${process.arch}`,
       buildId: 'deadbee',
       dshVersion: '0.1.0-rc.7',
       archive: 'dsh2.tar.gz',
@@ -464,74 +466,82 @@ async function main() {
     await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
     await ensureRuntime({ runtimeRoot: root, manifest: b.manifest, archivePath: b.archive, platform: process.platform, arch: process.arch })
 
-    // activate A (pending) then mark healthy → active, no previous yet
-    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
-    ok(readJson(path.join(root, 'pending.json')).runtimeId === a.manifest.runtimeId, 'pending written atomically')
-    markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
-    ok(readJson(path.join(root, 'active.json')).runtimeId === a.manifest.runtimeId, 'A active after healthy')
-    ok(!fs.existsSync(path.join(root, 'previous.json')), 'no previous on first activation')
+    // activate A (pending) then commit → active, no previous yet
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    ok(readRuntimeState({ runtimeRoot: root }).pending.runtimeId === a.manifest.runtimeId, 'pending written atomically')
+    commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    ok(readRuntimeState({ runtimeRoot: root }).active.runtimeId === a.manifest.runtimeId, 'A active after commit')
+    ok(readRuntimeState({ runtimeRoot: root }).previous === null, 'no previous on first activation')
 
-    // activate B (pending) → mark healthy → previous preserved as A
-    activateRuntime({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
-    markRuntimeHealthy({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
-    ok(readJson(path.join(root, 'active.json')).runtimeId === b.manifest.runtimeId, 'B active')
-    ok(readJson(path.join(root, 'previous.json')).runtimeId === a.manifest.runtimeId, 'A preserved as previous')
+    // activate B (pending) → commit → previous preserved as A
+    beginActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
+    ok(readRuntimeState({ runtimeRoot: root }).active.runtimeId === b.manifest.runtimeId, 'B active')
+    ok(readRuntimeState({ runtimeRoot: root }).previous.runtimeId === a.manifest.runtimeId, 'A preserved as previous')
 
-    // rollback: pending B failed → return to previous A
-    activateRuntime({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
-    const rb = rollbackRuntime({ runtimeRoot: root })
-    ok(rb.runtimeId === a.manifest.runtimeId, 'rollback returns previous runtime A')
-    ok(readJson(path.join(root, 'active.json')).runtimeId === a.manifest.runtimeId, 'active restored to A after rollback')
+    // commitRollback(previous A) → active restored, previous cleared
+    const rb = commitRollback({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    ok(rb.runtimeId === a.manifest.runtimeId, 'commitRollback returns previous runtime A')
+    ok(readRuntimeState({ runtimeRoot: root }).active.runtimeId === a.manifest.runtimeId, 'active restored to A after rollback')
+    ok(readRuntimeState({ runtimeRoot: root }).previous === null, 'previous cleared after rollback')
   }
 
-  console.log('\n[6b] getActiveRuntime clears stale pending')
+  console.log('\n[6b] recoverInterruptedTransition normalizes missing pending')
   {
     const root = tmpdir('stale-pending')
     const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
-    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
-    markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
-    // simulate an interrupted activation
-    fs.writeFileSync(path.join(root, 'pending.json'), JSON.stringify({ runtimeId: 'ghost', pendingAt: new Date().toISOString() }))
-    const active = getActiveRuntime({ runtimeRoot: root })
-    ok(active && active.runtimeId === a.manifest.runtimeId, 'active resolved despite stale pending')
-    ok(!fs.existsSync(path.join(root, 'pending.json')), 'stale pending cleared')
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+
+    // simulate a pending pointing at a missing runtime dir
+    const state = readRuntimeState({ runtimeRoot: root })
+    state.pending = { runtimeId: 'ghost', attemptCount: 1, lastAttemptAt: null, failureReason: null }
+    fs.writeFileSync(path.join(root, 'runtime-state.json'), JSON.stringify(state))
+
+    recoverInterruptedTransition({ runtimeRoot: root })
+    const s = readRuntimeState({ runtimeRoot: root })
+    ok(s.pending === null, 'missing pending cleared')
+    ok(s.failed && s.failed.runtimeId === 'ghost', 'missing pending moved to failed')
+    ok(s.active.runtimeId === a.manifest.runtimeId, 'active preserved')
   }
 
-  console.log('\n[6c] markRuntimeHealthy rejects invalid states; malicious runtimeId cannot resolve')
+  console.log('\n[6c] commitActivation rejects invalid states; malicious runtimeId cannot resolve')
   {
-    const root = tmpdir('strict-healthy')
+    const root = tmpdir('strict-commit')
     const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
 
-    // no pending → rejected, and no active.json written
+    // no pending → rejected, and no active written
     let threw = false
-    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId }) } catch (e) { threw = true }
-    ok(threw, 'markRuntimeHealthy without pending rejected')
-    ok(!fs.existsSync(path.join(root, 'active.json')), 'no active.json written on invalid markHealthy')
+    try { commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId }) } catch (e) { threw = true }
+    ok(threw, 'commitActivation without pending rejected')
+    ok(readRuntimeState({ runtimeRoot: root }).active === null, 'no active written on invalid commit')
 
     // pending exists but points at a different runtime → rejected
-    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
     const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     b.manifest = { ...b.manifest, runtimeId: `dsh-other-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
     await ensureRuntime({ runtimeRoot: root, manifest: b.manifest, archivePath: b.archive, platform: process.platform, arch: process.arch })
     let threw2 = false
-    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: b.manifest.runtimeId }) } catch (e) { threw2 = true }
-    ok(threw2, 'markRuntimeHealthy with mismatched pending rejected')
+    try { commitActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId }) } catch (e) { threw2 = true }
+    ok(threw2, 'commitActivation with mismatched pending rejected')
 
     // nonexistent runtime → rejected
     let threw3 = false
-    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: `dsh-nonexistent-deadbee-${process.platform}-${process.arch}` }) } catch (e) { threw3 = true }
-    ok(threw3, 'markRuntimeHealthy for nonexistent runtime rejected')
+    try { commitActivation({ runtimeRoot: root, runtimeId: `dsh-nonexistent-deadbee-${process.platform}-${process.arch}` }) } catch (e) { threw3 = true }
+    ok(threw3, 'commitActivation for nonexistent runtime rejected')
 
     // unsafe runtimeId → rejected (no traversal)
     let threw4 = false
-    try { markRuntimeHealthy({ runtimeRoot: root, runtimeId: '../../etc/passwd' }) } catch (e) { threw4 = true }
-    ok(threw4, 'markRuntimeHealthy for unsafe runtimeId rejected')
+    try { commitActivation({ runtimeRoot: root, runtimeId: '../../etc/passwd' }) } catch (e) { threw4 = true }
+    ok(threw4, 'commitActivation for unsafe runtimeId rejected')
 
-    // active.json containing a malicious runtimeId must not resolve (no escape)
-    fs.writeFileSync(path.join(root, 'active.json'), JSON.stringify({ runtimeId: '../../escape', activatedAt: new Date().toISOString() }))
-    ok(getActiveRuntime({ runtimeRoot: root }) === null, 'malicious active runtimeId does not resolve')
+    // state with a malicious active runtimeId must not resolve (no escape)
+    const state = readRuntimeState({ runtimeRoot: root })
+    state.active = { runtimeId: '../../escape', activatedAt: null }
+    fs.writeFileSync(path.join(root, 'runtime-state.json'), JSON.stringify(state))
+    ok(selectStartupCandidate({ runtimeRoot: root }).active === null, 'malicious active runtimeId does not resolve')
   }
 
   // ————————————————— [7] purge —————————————————
@@ -540,8 +550,8 @@ async function main() {
     const root = tmpdir('purge')
     const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
-    activateRuntime({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
-    markRuntimeHealthy({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
 
     // a second non-active runtime + downloads + staging to be purged
     const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
@@ -552,7 +562,7 @@ async function main() {
     const c = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     c.manifest = { ...c.manifest, runtimeId: `dsh-pending-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
     await ensureRuntime({ runtimeRoot: root, manifest: c.manifest, archivePath: c.archive, platform: process.platform, arch: process.arch })
-    activateRuntime({ runtimeRoot: root, runtimeId: c.manifest.runtimeId })
+    beginActivation({ runtimeRoot: root, runtimeId: c.manifest.runtimeId })
 
     fs.mkdirSync(path.join(root, 'downloads', 'x'), { recursive: true })
     fs.writeFileSync(path.join(root, 'downloads', 'x', 'partial.tar.gz'), 'x')
@@ -564,7 +574,7 @@ async function main() {
     ok(!fs.existsSync(path.join(root, 'runtimes', b.manifest.runtimeId)), 'non-active runtime purged')
     ok(!fs.existsSync(path.join(root, 'downloads', 'x')), 'downloads purged')
     ok(!fs.existsSync(path.join(root, 'staging', 'y')), 'staging purged')
-    ok(readJson(path.join(root, 'active.json')).runtimeId === a.manifest.runtimeId, 'active.json preserved')
+    ok(readRuntimeState({ runtimeRoot: root }).active.runtimeId === a.manifest.runtimeId, 'active preserved in state')
   }
 
   // ————————————————— [8] EngineManager explicit paths —————————————————
@@ -579,6 +589,101 @@ async function main() {
     // without explicit paths, constructor must NOT silently resolve resources/dsh
     const em2 = new EngineManager({ dshHome: tmpdir('dsh-home2') })
     ok(em2.nodeBin === null && em2.dshBin === null, 'no implicit resource discovery in production')
+  }
+
+  // ————————————————— [9] runtime-state.json + six-state machine —————————————————
+  console.log('\n[9] readRuntimeState defaults / normalize')
+  {
+    const empty = tmpdir('empty-state')
+    const s0 = readRuntimeState({ runtimeRoot: empty })
+    ok(s0.schemaVersion === 2 && s0.active === null && s0.channel === 'stable', 'default state when no file')
+
+    fs.writeFileSync(path.join(empty, 'runtime-state.json'), '{ not json')
+    const sBad = readRuntimeState({ runtimeRoot: empty })
+    ok(sBad.schemaVersion === 2 && sBad.active === null, 'corrupt state normalizes to defaults')
+  }
+
+  console.log('\n[9b] migrateLegacyState merges old files then deletes them')
+  {
+    const root = tmpdir('migrate')
+    const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+    fs.writeFileSync(path.join(root, 'active.json'), JSON.stringify({ runtimeId: a.manifest.runtimeId, activatedAt: 'x' }))
+    fs.writeFileSync(path.join(root, 'previous.json'), JSON.stringify({ runtimeId: 'dsh-old-1', activatedAt: 'y' }))
+    fs.writeFileSync(path.join(root, 'pending.json'), JSON.stringify({ runtimeId: 'dsh-pend-1', pendingAt: 'z' }))
+
+    ok(migrateLegacyState({ runtimeRoot: root }) === true, 'migration performed')
+    ok(fs.existsSync(path.join(root, 'runtime-state.json')), 'runtime-state.json written')
+    ok(!fs.existsSync(path.join(root, 'active.json')), 'active.json deleted after migration')
+    ok(!fs.existsSync(path.join(root, 'previous.json')), 'previous.json deleted after migration')
+    ok(!fs.existsSync(path.join(root, 'pending.json')), 'pending.json deleted after migration')
+
+    const s = readRuntimeState({ runtimeRoot: root })
+    ok(s.active.runtimeId === a.manifest.runtimeId, 'active migrated')
+    ok(s.previous.runtimeId === 'dsh-old-1', 'previous migrated')
+    ok(s.pending.runtimeId === 'dsh-pend-1' && s.pending.attemptCount === 0, 'pending migrated with attemptCount 0')
+    ok(migrateLegacyState({ runtimeRoot: root }) === false, 'migration is a no-op when state file exists')
+  }
+
+  console.log('\n[9c] attemptCount, failActivation, retryFailedRuntime')
+  {
+    const root = tmpdir('attempt')
+    const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+
+    const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    b.manifest = { ...b.manifest, runtimeId: `dsh-b-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
+    await ensureRuntime({ runtimeRoot: root, manifest: b.manifest, archivePath: b.archive, platform: process.platform, arch: process.arch })
+
+    beginActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
+    ok(readRuntimeState({ runtimeRoot: root }).pending.attemptCount === 1, 'first attempt count = 1')
+    beginActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
+    ok(readRuntimeState({ runtimeRoot: root }).pending.attemptCount === 2, 're-attempt count = 2')
+
+    failActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId, reason: 'boom' })
+    const s = readRuntimeState({ runtimeRoot: root })
+    ok(s.pending === null, 'pending cleared on fail')
+    ok(s.failed.runtimeId === b.manifest.runtimeId && s.failed.failureReason === 'boom', 'failed recorded with reason')
+    ok(s.active.runtimeId === a.manifest.runtimeId, 'active unchanged on fail')
+
+    retryFailedRuntime({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
+    const s2 = readRuntimeState({ runtimeRoot: root })
+    ok(s2.failed === null, 'failed cleared on retry')
+    ok(s2.pending.runtimeId === b.manifest.runtimeId && s2.pending.attemptCount === 0, 'pending re-queued with attemptCount 0')
+  }
+
+  console.log('\n[9d] commitRollback requires matching previous')
+  {
+    const root = tmpdir('rollback-strict')
+    const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+
+    let threw = false
+    try { commitRollback({ runtimeRoot: root, runtimeId: a.manifest.runtimeId }) } catch (e) { threw = true }
+    ok(threw, 'commitRollback without previous rejected')
+  }
+
+  console.log('\n[9e] selectStartupCandidate priority order')
+  {
+    const root = tmpdir('candidate')
+    const a = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest: a.manifest, archivePath: a.archive, platform: process.platform, arch: process.arch })
+    const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    b.manifest = { ...b.manifest, runtimeId: `dsh-b2-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
+    await ensureRuntime({ runtimeRoot: root, manifest: b.manifest, archivePath: b.archive, platform: process.platform, arch: process.arch })
+
+    beginActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    commitActivation({ runtimeRoot: root, runtimeId: a.manifest.runtimeId })
+    beginActivation({ runtimeRoot: root, runtimeId: b.manifest.runtimeId })
+
+    const c = selectStartupCandidate({ runtimeRoot: root })
+    ok(c.pending === b.manifest.runtimeId, 'pending is first candidate')
+    ok(c.active === a.manifest.runtimeId, 'active is second candidate')
+    ok(c.previous === null, 'no previous yet')
   }
 
   console.log(`\n=== result: ${passed} passed, ${failed} failed ===`)

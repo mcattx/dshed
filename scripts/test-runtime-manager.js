@@ -149,6 +149,25 @@ async function main() {
     const traversalArchive = makeManifest({ archive: '../evil.tar.gz' })
     ok(!validateManifest(traversalArchive).valid, 'archive path traversal rejected')
 
+    // P0 regression: runtimeId is used as a directory name — must be a safe basename
+    const traversalRuntimeId = makeManifest({ runtimeId: '../../escaped-build', buildId: 'escaped-build' })
+    ok(!validateManifest(traversalRuntimeId).valid, 'runtimeId path traversal rejected')
+
+    const slashRuntimeId = makeManifest({ runtimeId: 'a/b', buildId: 'a' })
+    ok(!validateManifest(slashRuntimeId).valid, 'runtimeId with slash rejected')
+
+    const dotRuntimeId = makeManifest({ runtimeId: '..', buildId: '' })
+    ok(!validateManifest(dotRuntimeId).valid, 'runtimeId ".." rejected')
+
+    const badBuildId = makeManifest({ buildId: '../evil' })
+    ok(!validateManifest(badBuildId).valid, 'buildId traversal rejected')
+
+    const badPlatformValue = makeManifest({ platform: 'freebsd' })
+    ok(!validateManifest(badPlatformValue).valid, 'unknown platform value rejected')
+
+    const badArchValue = makeManifest({ arch: 'ia32' })
+    ok(!validateManifest(badArchValue).valid, 'unknown arch value rejected')
+
     const tooOld = makeManifest({ minimumDshedVersion: '0.2.0' })
     ok(!validateManifest(tooOld, { currentDshedVersion: '0.1.0', platform: process.platform, arch: process.arch }).valid, 'minimumDshedVersion older shell rejected')
 
@@ -161,6 +180,10 @@ async function main() {
   ok(compareVersions('0.1.0', '0.1.5') === -1, '0.1.0 < 0.1.5')
   ok(compareVersions('0.1.0', '0.1.0-rc.6') === 1, 'release > prerelease')
   ok(compareVersions('0.2.0', '0.1.9') === 1, '0.2.0 > 0.1.9')
+  // P2 regression: prerelease identifiers must compare numerically, not lexically
+  ok(compareVersions('0.1.0-rc.10', '0.1.0-rc.8') === 1, 'rc.10 > rc.8 (numeric prerelease)')
+  ok(compareVersions('0.1.0-rc.2', '0.1.0-rc.10') === -1, 'rc.2 < rc.10')
+  ok(compareVersions('0.1.0-rc.1', '0.1.0-rc.1') === 0, 'equal prerelease')
   ok(isSafeRelativePath('a/b/c.js') === true, 'safe relative path ok')
   ok(isSafeRelativePath('/abs') === false, 'absolute path unsafe')
   ok(isSafeRelativePath('../x') === false, 'traversal unsafe')
@@ -224,6 +247,43 @@ async function main() {
     ok(threw3, 'absolute symlink target rejected')
   }
 
+  console.log('\n[3c] missing tar terminator block rejected')
+  {
+    // gzip is valid and decompresses fully, but the tar stream lacks the two
+    // zero terminator blocks — must be rejected, not silently accepted.
+    const noTerm = path.join(tmpdir('no-term'), 'no-term.tar.gz')
+    const gzip = zlib.createGzip()
+    const chunks = []
+    gzip.on('data', (c) => chunks.push(c))
+    gzip.write(writeHeader('file.txt', '0', 2, null))
+    gzip.write(writeData(Buffer.from('hi')))
+    gzip.end() // intentionally no terminator blocks
+    await new Promise((resolve, reject) => { gzip.on('end', resolve); gzip.on('error', reject) })
+    fs.writeFileSync(noTerm, Buffer.concat(chunks))
+    let threw = false
+    try { await unpackArchive(noTerm, tmpdir('no-term-dest')) } catch (e) { threw = true }
+    ok(threw, 'missing terminator block rejected')
+  }
+
+  console.log('\n[3d] corrupt header checksum rejected')
+  {
+    const bad = path.join(tmpdir('bad-chksum'), 'bad-chksum.tar.gz')
+    const hdr = writeHeader('file.txt', '0', 2, null)
+    hdr[10] = hdr[10] ^ 0xff // corrupt a name byte without recomputing checksum
+    const gzip = zlib.createGzip()
+    const chunks = []
+    gzip.on('data', (c) => chunks.push(c))
+    gzip.write(hdr)
+    gzip.write(writeData(Buffer.from('hi')))
+    gzip.write(Buffer.alloc(BLOCK * 2))
+    gzip.end()
+    await new Promise((resolve, reject) => { gzip.on('end', resolve); gzip.on('error', reject) })
+    fs.writeFileSync(bad, Buffer.concat(chunks))
+    let threw = false
+    try { await unpackArchive(bad, tmpdir('bad-chksum-dest')) } catch (e) { threw = true }
+    ok(threw, 'corrupt header checksum rejected')
+  }
+
   // ————————————————— [4] ensureRuntime —————————————————
   console.log('\n[4] ensureRuntime')
   {
@@ -270,6 +330,31 @@ async function main() {
     ok(!fs.existsSync(path.join(root, 'staging', freshManifest.runtimeId, 'partial')), 'stale staging cleaned before reinstall')
   }
 
+  console.log('\n[4c] corrupt/old-format complete.json is not treated as ready')
+  {
+    const root = tmpdir('corrupt')
+    const { archive, manifest } = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch })
+    markRuntimeHealthy({ runtimeRoot: root, runtimeId: manifest.runtimeId })
+
+    // corrupt complete.json (bad sha256) → active runtime no longer resolves as ready
+    const completePath = path.join(root, 'runtimes', manifest.runtimeId, 'complete.json')
+    const complete = JSON.parse(fs.readFileSync(completePath, 'utf8'))
+    complete.sha256 = 'not-a-sha'
+    fs.writeFileSync(completePath, JSON.stringify(complete))
+    ok(getActiveRuntime({ runtimeRoot: root }) === null, 'corrupt complete.json makes active runtime not-ready')
+
+    // old-format complete.json (missing fields) → not ready
+    fs.writeFileSync(completePath, JSON.stringify({ formatVersion: 1 }))
+    ok(getActiveRuntime({ runtimeRoot: root }) === null, 'incomplete complete.json is not ready')
+
+    // a runtime directory with mismatched identity is refused, not overwritten
+    fs.writeFileSync(completePath, JSON.stringify({ ...complete, sha256: manifest.sha256, buildId: 'deadbee' }))
+    let threw = false
+    try { await ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: process.platform, arch: process.arch }) } catch (e) { threw = true }
+    ok(threw, 'identity mismatch refuses reinstall instead of overwriting')
+  }
+
   // ————————————————— [5] lock —————————————————
   console.log('\n[5] cross-process lock')
   {
@@ -312,6 +397,34 @@ async function main() {
     await childExit
     ok(elapsed >= 1000, `parent blocked while child held lock (${elapsed}ms)`)
     rel()
+  }
+
+  console.log('\n[5c] two concurrent ensureRuntime both succeed (idempotent)')
+  {
+    const root = tmpdir('concurrent')
+    const { archive, manifest } = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    const script = `
+      const { ensureRuntime } = require(${JSON.stringify(path.join(__dirname, '..', 'src', 'runtime-manager.js'))});
+      const root = process.env.RT_ROOT;
+      const archive = process.env.RT_ARCHIVE;
+      const manifest = JSON.parse(process.env.RT_MANIFEST);
+      ensureRuntime({ runtimeRoot: root, manifest, archivePath: archive, platform: manifest.platform, arch: manifest.arch })
+        .then(() => process.exit(0))
+        .catch((e) => { console.error(e.message); process.exit(1); });
+    `
+    const env = {
+      ...process.env,
+      RT_ROOT: root,
+      RT_ARCHIVE: archive,
+      RT_MANIFEST: JSON.stringify(manifest),
+    }
+    const runInstall = () => new Promise((resolve) => {
+      const p = spawn(process.execPath, ['-e', script], { env, stdio: 'ignore' })
+      p.on('exit', (code) => resolve(code))
+    })
+    const [c1, c2] = await Promise.all([runInstall(), runInstall()])
+    ok(c1 === 0 && c2 === 0, `both concurrent ensureRuntime succeed (codes ${c1}, ${c2})`)
+    ok(fs.existsSync(path.join(root, 'runtimes', manifest.runtimeId, 'complete.json')), 'runtime installed exactly once')
   }
 
   // ————————————————— [6] activate / healthy / rollback —————————————————
@@ -377,12 +490,20 @@ async function main() {
     const b = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
     b.manifest = { ...b.manifest, runtimeId: `dsh-old-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
     await ensureRuntime({ runtimeRoot: root, manifest: b.manifest, archivePath: b.archive, platform: process.platform, arch: process.arch })
+
+    // a third runtime marked pending must survive purge (it is about to start)
+    const c = await buildRuntime(root, 'node_modules/@deepseek-ai/dsh/lib/bin.js')
+    c.manifest = { ...c.manifest, runtimeId: `dsh-pending-deadbee-${process.platform}-${process.arch}`, buildId: 'deadbee' }
+    await ensureRuntime({ runtimeRoot: root, manifest: c.manifest, archivePath: c.archive, platform: process.platform, arch: process.arch })
+    activateRuntime({ runtimeRoot: root, runtimeId: c.manifest.runtimeId })
+
     fs.mkdirSync(path.join(root, 'downloads', 'x'), { recursive: true })
     fs.writeFileSync(path.join(root, 'downloads', 'x', 'partial.tar.gz'), 'x')
     fs.mkdirSync(path.join(root, 'staging', 'y'), { recursive: true })
 
-    purgeRuntimeCache({ runtimeRoot: root })
+    await purgeRuntimeCache({ runtimeRoot: root })
     ok(fs.existsSync(path.join(root, 'runtimes', a.manifest.runtimeId, 'complete.json')), 'active runtime preserved')
+    ok(fs.existsSync(path.join(root, 'runtimes', c.manifest.runtimeId, 'complete.json')), 'pending runtime preserved')
     ok(!fs.existsSync(path.join(root, 'runtimes', b.manifest.runtimeId)), 'non-active runtime purged')
     ok(!fs.existsSync(path.join(root, 'downloads', 'x')), 'downloads purged')
     ok(!fs.existsSync(path.join(root, 'staging', 'y')), 'staging purged')

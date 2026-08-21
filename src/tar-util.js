@@ -139,6 +139,29 @@ function assertSafeLink(absPath, target, root) {
   }
 }
 
+/** verify a tar header checksum (chksum field vs recomputed) */
+function verifyChecksum(header) {
+  const raw = header.slice(148, 156).toString('utf8')
+  const cleaned = raw.replace(/[\0 ]/g, '')
+  if (!/^[0-7]+$/.test(cleaned)) return false
+  return parseInt(cleaned, 8) === checksum(header)
+}
+
+/** parse the octal size field; reject malformed values instead of coercing to 0 */
+function parseOctalSize(header) {
+  const raw = header.slice(124, 136).toString('utf8')
+  // base-256 (GNU large-file) encoding is not produced by our packer; reject it
+  if (raw.length > 0 && (raw.charCodeAt(0) & 0x80) !== 0) {
+    throw new Error('base-256 size field not supported')
+  }
+  const cleaned = raw.replace(/[\0 ]/g, '')
+  if (cleaned === '') return 0
+  if (!/^[0-7]+$/.test(cleaned)) {
+    throw new Error(`invalid tar size field: ${JSON.stringify(raw)}`)
+  }
+  return parseInt(cleaned, 8)
+}
+
 // ————————————————————————————————— unpack ——————————————————————————————————
 
 /**
@@ -198,9 +221,13 @@ function unpackArchive(archivePath, destDir, opts = {}) {
             sawEnd = true
             break
           }
+          if (!verifyChecksum(header)) {
+            fail(new Error('tar header checksum mismatch'))
+            return
+          }
           const nameField = header.slice(0, 100).toString('utf8').replace(/\0.*$/, '')
           const typeflag = String.fromCharCode(header[156])
-          const size = parseInt(header.slice(124, 136).toString('utf8').replace(/\0.*$/, '').trim() || '0', 8) || 0
+          const size = parseOctalSize(header)
           const linkname = header.slice(157, 257).toString('utf8').replace(/\0.*$/, '')
           const dataLen = Math.ceil(size / BLOCK) * BLOCK
 
@@ -227,7 +254,7 @@ function unpackArchive(archivePath, destDir, opts = {}) {
             assertSafeLink(dest, linkname, root)
             fs.mkdirSync(path.dirname(dest), { recursive: true })
             try { fs.symlinkSync(linkname, dest) } catch (e) { /* best effort */ }
-          } else if (typeflag === '0' || typeflag === '\0' || typeflag === '') {
+          } else if (typeflag === '0' || typeflag === '\0') {
             fs.mkdirSync(path.dirname(dest), { recursive: true })
             const fd = fs.openSync(dest, 'w')
             try { fs.writeSync(fd, data.slice(0, size)) } finally { fs.closeSync(fd) }
@@ -244,11 +271,13 @@ function unpackArchive(archivePath, destDir, opts = {}) {
     gunzip.on('data', onData)
     gunzip.on('end', () => {
       if (settled) return
-      if (sawEnd || pendingLongName === null) {
-        done()
-      } else {
-        fail(new Error('truncated archive: missing terminator'))
+      // a well-formed archive must end with the zero terminator block; a gzip
+      // that decompresses fully without one is a truncated tar and is rejected.
+      if (!sawEnd) {
+        fail(new Error('truncated archive: missing terminator (EOF before end-of-archive block)'))
+        return
       }
+      done()
     })
   })
 }

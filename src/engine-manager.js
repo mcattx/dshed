@@ -26,16 +26,6 @@ const HEALTH_TIMEOUT_MS = 2000
 const GRACEFUL_TIMEOUT_MS = 3000
 const MAX_CONSECUTIVE_CRASHES = 5
 
-/** resource base: packaged extraResources live in process.resourcesPath (asar sibling); dev uses project resources/ */
-function resourceBase() {
-  if (process.env.HARBOR_RESOURCES) return process.env.HARBOR_RESOURCES
-  // packaged runtime: process.resourcesPath = dshed.app/Contents/Resources, dsh dir sits alongside
-  if (process.resourcesPath && fs.existsSync(path.join(process.resourcesPath, 'dsh'))) {
-    return process.resourcesPath
-  }
-  return path.join(__dirname, '..', 'resources')
-}
-
 /** resolve dsh entry from @deepseek-ai/dsh/package.json bin field (P2, no hardcoded paths) */
 function resolveDshBin(base) {
   const manifest = path.join(base, 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
@@ -55,10 +45,16 @@ class EngineManager extends EventEmitter {
   /**
    * @param {object} opts
    * @param {string} opts.dshHome DSH_HOME directory (defaults to app userData/dsh)
+   * @param {string} [opts.nodeBin] explicit node executable path (production)
+   * @param {string} [opts.dshBin] explicit dsh entry path (production)
+   * @param {string} [opts.base] resource base dir used to resolve node/dsh in dev
+   *
+   * Production callers pass nodeBin/dshBin explicitly (resolved by the runtime
+   * manager + bundled node). Dev/test callers may pass `base` to resolve them.
+   * There is NO implicit discovery of resources/dsh at runtime.
    */
-  constructor({ dshHome, base, logger } = {}) {
+  constructor({ dshHome, base, nodeBin, dshBin, logger } = {}) {
     super()
-    this.base = base || resourceBase()
     this.dshHome = dshHome || path.join(process.env.HOME || '.', '.dshed', 'dsh')
     this.logger = logger || { info: () => {}, error: () => {} }
     this.child = null
@@ -66,8 +62,8 @@ class EngineManager extends EventEmitter {
     this.stopping = false
     this.consecutiveCrashes = 0
     this.restartTimer = null
-    this.nodeBin = resolveNodeBin(this.base)
-    this.dshBin = resolveDshBin(this.base)
+    this.nodeBin = nodeBin || (base ? resolveNodeBin(base) : null)
+    this.dshBin = dshBin || (base ? resolveDshBin(base) : null)
   }
 
   /** Start the engine, resolves with the discovered port (Promise<number>) */
@@ -75,6 +71,8 @@ class EngineManager extends EventEmitter {
     this.stopping = false
     return new Promise((resolve, reject) => {
       fs.mkdirSync(this.dshHome, { recursive: true, mode: 0o700 })
+      if (!this.nodeBin) return reject(new Error('node runtime not configured (pass nodeBin or base)'))
+      if (!this.dshBin) return reject(new Error('dsh entry not configured (pass dshBin or base)'))
       if (!fs.existsSync(this.nodeBin)) return reject(new Error(`node runtime not found: ${this.nodeBin}`))
       if (!fs.existsSync(this.dshBin)) return reject(new Error(`dsh entry not found: ${this.dshBin}`))
 

@@ -115,7 +115,7 @@ async function main() {
   console.log(`DSH_HOME: ${dshHome}`)
 
   console.log('\n[1] engine start / port discovery / health check')
-  const engine = new EngineManager({ dshHome })
+  const engine = new EngineManager({ dshHome, base: path.join(__dirname, '..', 'resources') })
   const port = await engine.start()
   ok(Number.isInteger(port) && port > 0, `port discovered: ${port}`)
   const health = await httpGet(port, '/')

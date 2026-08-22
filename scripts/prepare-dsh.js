@@ -190,6 +190,7 @@ async function prepareDsh() {
   // (x64 → arm64 outputs are unusable)
   env.PATH = `${path.dirname(bundledNode)}${path.delimiter}${env.PATH || ''}`
   execFileSync(bundledNode, [
+    '--max-old-space-size=4096',
     npmCli, 'install', DSH_PKG, '--omit=dev', '--no-audit', '--no-fund', '--registry', registry,
   ], { cwd: dshDir, stdio: 'inherit', env })
   log('dsh installed')

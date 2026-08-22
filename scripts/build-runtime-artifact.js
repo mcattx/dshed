@@ -119,6 +119,7 @@ function installDsh(nodeBin, dshDir, version) {
   env.PATH = `${nodeDir}${path.delimiter}${env.PATH || ''}`
   log(`installing @deepseek-ai/dsh@${version} (registry=${registry})`)
   execFileSync(nodeBin, [
+    '--max-old-space-size=4096',
     npmCli, 'install', `@deepseek-ai/dsh@${version}`, '--omit=dev', '--no-audit', '--no-fund', '--registry', registry,
   ], { cwd: dshDir, stdio: 'inherit', env })
 }

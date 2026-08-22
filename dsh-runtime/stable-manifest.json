@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 2,
+  "latest": {
+    "dshVersion": "0.1.0-rc.8",
+    "minimumDshedVersion": "0.1.0",
+    "releasedAt": "2026-08-22T02:43:42.798Z",
+    "artifacts": [
+      {
+        "platform": "darwin",
+        "arch": "arm64",
+        "runtimeId": "dsh-0.1.0-rc.8-795383b4ca58-darwin-arm64",
+        "buildId": "795383b4ca58",
+        "releaseTag": "dsh-v0.1.0-rc.8-795383b4ca58",
+        "archive": "dsh-0.1.0-rc.8-795383b4ca58-darwin-arm64.tar.gz",
+        "sha256": "98ac931eb676046561e190430b29fefb71f254d9cf958df0bcce1a491e7db1d7",
+        "size": 55212323,
+        "extractedSize": 209462147,
+        "extractedFileCount": 29449,
+        "entry": "node_modules/@deepseek-ai/dsh/lib/bin.js"
+      }
+    ]
+  }
+}

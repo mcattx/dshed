@@ -15,6 +15,7 @@ const { EngineManager } = require('../src/engine-manager')
 const {
   ensureRuntime, readRuntimeState, recoverInterruptedTransition, selectStartupCandidate,
   beginActivation, commitActivation, failActivation, commitRollback, resolveReadyRuntime,
+  preparePending, retryFailedRuntime,
 } = require('../src/runtime-manager')
 
 let passed = 0
@@ -100,7 +101,6 @@ async function main() {
 
     // background prepare rc.8 (install + pending; active stays rc.6)
     await ensureRuntime({ runtimeRoot: root, manifest: RC8_MANIFEST, archivePath: RC8_ARCHIVE, platform: RC6_MANIFEST.platform, arch: RC6_MANIFEST.arch })
-    const { preparePending } = require('../src/runtime-manager')
     preparePending({ runtimeRoot: root, runtimeId: RC8_MANIFEST.runtimeId })
     const sA2 = readRuntimeState({ runtimeRoot: root })
     ok(sA2.active.runtimeId === RC6_MANIFEST.runtimeId, 'active still rc.6 after prepare')
@@ -132,7 +132,6 @@ async function main() {
     const entryAbs = path.join(root, 'runtimes', RC8_MANIFEST.runtimeId, RC8_MANIFEST.entry)
     fs.writeFileSync(entryAbs, 'process.exit(1)\n') // engine start fails immediately
 
-    const { preparePending } = require('../src/runtime-manager')
     preparePending({ runtimeRoot: root, runtimeId: RC8_MANIFEST.runtimeId })
 
     const res = await coldStart(root, dshHome)
@@ -142,6 +141,44 @@ async function main() {
     ok(sB.failed && sB.failed.runtimeId === RC8_MANIFEST.runtimeId, 'rc.8 recorded as failed')
     ok(sB.pending === null, 'pending cleared after rollback')
     ok(sB.previous === null, 'previous cleared after rollback')
+  }
+
+  // ————————————————— scenario C: manual retry of a failed runtime after fixing it —————————————————
+  console.log('\n[C] manual retry of failed runtime after fix')
+  {
+    const root = tmpdir('retry')
+    const dshHome = tmpdir('home')
+
+    await ensureRuntime({ runtimeRoot: root, manifest: RC6_MANIFEST, archivePath: RC6_ARCHIVE, platform: RC6_MANIFEST.platform, arch: RC6_MANIFEST.arch })
+    beginActivation({ runtimeRoot: root, runtimeId: RC6_MANIFEST.runtimeId })
+    await tryStart(resolveReadyRuntime(root, RC6_MANIFEST.runtimeId), dshHome)
+    commitActivation({ runtimeRoot: root, runtimeId: RC6_MANIFEST.runtimeId })
+
+    // rc.8 pending with a sabotaged entry → cold-start failure → failed
+    await ensureRuntime({ runtimeRoot: root, manifest: RC8_MANIFEST, archivePath: RC8_ARCHIVE, platform: RC6_MANIFEST.platform, arch: RC6_MANIFEST.arch })
+    const entryAbs = path.join(root, 'runtimes', RC8_MANIFEST.runtimeId, RC8_MANIFEST.entry)
+    fs.writeFileSync(entryAbs, 'process.exit(1)\n')
+    preparePending({ runtimeRoot: root, runtimeId: RC8_MANIFEST.runtimeId })
+    await coldStart(root, dshHome)
+    ok(readRuntimeState({ runtimeRoot: root }).failed.runtimeId === RC8_MANIFEST.runtimeId, 'rc.8 recorded as failed')
+
+    // fix rc.8: remove the broken runtime dir and reinstall (restores entry)
+    fs.rmSync(path.join(root, 'runtimes', RC8_MANIFEST.runtimeId), { recursive: true, force: true })
+    await ensureRuntime({ runtimeRoot: root, manifest: RC8_MANIFEST, archivePath: RC8_ARCHIVE, platform: RC6_MANIFEST.platform, arch: RC6_MANIFEST.arch })
+
+    // manual retry: failed → pending (attemptCount reset to 0)
+    retryFailedRuntime({ runtimeRoot: root, runtimeId: RC8_MANIFEST.runtimeId })
+    const sC1 = readRuntimeState({ runtimeRoot: root })
+    ok(sC1.pending && sC1.pending.runtimeId === RC8_MANIFEST.runtimeId && sC1.pending.attemptCount === 0, 'retry re-queues pending with attemptCount 0')
+    ok(sC1.failed === null, 'failed cleared on retry')
+    ok(sC1.active.runtimeId === RC6_MANIFEST.runtimeId, 'active stays rc.6 until the retried cold start')
+
+    // cold start succeeds this time
+    const res = await coldStart(root, dshHome)
+    const sC2 = readRuntimeState({ runtimeRoot: root })
+    ok(res.started === RC8_MANIFEST.runtimeId, 'rc.8 activated on manual retry')
+    ok(sC2.active.runtimeId === RC8_MANIFEST.runtimeId, 'rc.8 is active after retry')
+    ok(sC2.previous && sC2.previous.runtimeId === RC6_MANIFEST.runtimeId, 'rc.6 is previous after retry')
   }
 
   console.log(`\n=== result: ${passed} passed, ${failed} failed ===`)

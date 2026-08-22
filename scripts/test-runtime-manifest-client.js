@@ -34,6 +34,7 @@ const ARTIFACT = {
   platform: 'darwin', arch: 'arm64',
   runtimeId: 'dsh-0.1.0-rc.8-a1435ba6f384-darwin-arm64',
   buildId: 'a1435ba6f384',
+  releaseTag: 'dsh-v0.1.0-rc.8-a1435ba6f384',
   archive: 'dsh-0.1.0-rc.8-a1435ba6f384-darwin-arm64.tar.gz',
   sha256: 'a'.repeat(64),
   size: 100,
@@ -46,7 +47,6 @@ function makeMatrix(overrides = {}) {
   return Object.assign({
     schemaVersion: 2,
     latest: {
-      releaseTag: 'dsh-v0.1.0-rc.8-a1435ba6f384',
       dshVersion: '0.1.0-rc.8',
       minimumDshedVersion: '0.1.0',
       releasedAt: '2026-08-22T00:00:00.000Z',
@@ -73,13 +73,11 @@ async function main() {
 
   console.log('\n[1] validateMatrix')
   {
-    ok(validateMatrix(makeMatrix()).releaseTag === 'dsh-v0.1.0-rc.8-a1435ba6f384', 'valid matrix accepted')
+    ok(validateMatrix(makeMatrix()).dshVersion === '0.1.0-rc.8', 'valid matrix accepted')
 
     for (const [name, mutate] of [
       ['schemaVersion 1', (m) => { m.schemaVersion = 1 }],
       ['missing latest', (m) => { delete m.latest }],
-      ['releaseTag without dsh-v prefix', (m) => { m.latest.releaseTag = 'v0.1.0-rc.8' }],
-      ['releaseTag with slash', (m) => { m.latest.releaseTag = 'dsh-v../x' }],
       ['bad dshVersion', (m) => { m.latest.dshVersion = 'not-a-version' }],
       ['bad minimumDshedVersion', (m) => { m.latest.minimumDshedVersion = 'x' }],
       ['missing releasedAt', (m) => { delete m.latest.releasedAt }],
@@ -126,6 +124,15 @@ async function main() {
     let threw = false
     try { resolveArtifact(bad.latest, bad.latest.artifacts[0], 'stable') } catch (e) { threw = true }
     ok(threw, 'unsafe archive rejected')
+
+    // releaseTag lives on the artifact and must carry the dsh-v prefix
+    for (const tag of ['v0.1.0-rc.8', 'dsh-v../x', undefined]) {
+      const bt = makeMatrix()
+      bt.latest.artifacts = [{ ...ARTIFACT, releaseTag: tag }]
+      let t = false
+      try { resolveArtifact(bt.latest, bt.latest.artifacts[0], 'stable') } catch (e) { t = true }
+      ok(t, `invalid releaseTag ${JSON.stringify(tag)} rejected`)
+    }
   }
 
   console.log('\n[4] fetchManifest uses fixed endpoint + resolves artifact')

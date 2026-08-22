@@ -59,15 +59,12 @@ async function fetchManifestJson(url, { transport, signal }) {
   try { return JSON.parse(body) } catch (e) { throw new Error('manifest is not valid JSON') }
 }
 
-/** validate the matrix envelope (schemaVersion + latest + releaseTag/versions) */
+/** validate the matrix envelope (schemaVersion + latest + versions + artifacts) */
 function validateMatrix(raw) {
   if (!isObject(raw)) throw new Error('manifest must be an object')
   if (raw.schemaVersion !== 2) throw new Error(`unsupported schemaVersion: ${raw.schemaVersion}`)
   if (!isObject(raw.latest)) throw new Error('manifest.latest must be an object')
   const latest = raw.latest
-  if (typeof latest.releaseTag !== 'string' || !RELEASE_TAG_RE.test(latest.releaseTag)) {
-    throw new Error(`invalid releaseTag: ${latest.releaseTag}`)
-  }
   if (typeof latest.dshVersion !== 'string' || !VERSION_RE.test(latest.dshVersion)) {
     throw new Error(`invalid dshVersion: ${latest.dshVersion}`)
   }
@@ -101,6 +98,10 @@ function deriveArtifactUrl(releaseTag, archive) {
 
 /** build a single-artifact manifest (schemaVersion 1) and validate it */
 function resolveArtifact(latest, artifact, channel) {
+  // releaseTag is per-artifact (contains the platform-specific buildId)
+  if (typeof artifact.releaseTag !== 'string' || !RELEASE_TAG_RE.test(artifact.releaseTag)) {
+    throw new Error(`invalid artifact releaseTag: ${artifact.releaseTag}`)
+  }
   const single = {
     schemaVersion: 1,
     runtimeId: artifact.runtimeId,
@@ -119,8 +120,8 @@ function resolveArtifact(latest, artifact, channel) {
   }
   const check = validateManifest(single, { platform: artifact.platform, arch: artifact.arch })
   if (!check.valid) throw new Error(`invalid artifact: ${check.errors.join('; ')}`)
-  const artifactUrl = deriveArtifactUrl(latest.releaseTag, artifact.archive)
-  return { ...single, releaseTag: latest.releaseTag, channel, artifactUrl }
+  const artifactUrl = deriveArtifactUrl(artifact.releaseTag, artifact.archive)
+  return { ...single, releaseTag: artifact.releaseTag, channel, artifactUrl }
 }
 
 /**

@@ -76,12 +76,12 @@ function makeMatrix(bundle) {
   return {
     schemaVersion: 2,
     latest: {
-      releaseTag: m.releaseTag,
       dshVersion: m.dshVersion,
       minimumDshedVersion: m.minimumDshedVersion,
       releasedAt: m.releasedAt,
       artifacts: [{
         platform: m.platform, arch: m.arch, runtimeId: m.runtimeId, buildId: m.buildId,
+        releaseTag: m.releaseTag,
         archive: m.archive, sha256: m.sha256, size: m.size,
         extractedSize: m.extractedSize, extractedFileCount: m.extractedFileCount, entry: m.entry,
       }],
@@ -185,7 +185,7 @@ async function main() {
     await makeActive(root, rc6)
     // invalid matrix (bad releaseTag) → fetchManifest throws
     const bad = makeMatrix(rc8)
-    bad.latest.releaseTag = 'v0.1.0-rc.8'
+    bad.latest.artifacts[0].releaseTag = 'v0.1.0-rc.8'
     const r = await runBackgroundUpdate({
       runtimeRoot: root, platform: process.platform, arch: process.arch,
       transport: makeMatrixTransport(bad),

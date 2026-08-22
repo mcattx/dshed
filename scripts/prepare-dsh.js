@@ -20,7 +20,8 @@ const crypto = require('node:crypto')
 const { packDirectory } = require('../src/tar-util')
 
 const NODE_VERSION = 'v22.23.2'
-const DSH_PKG = '@deepseek-ai/dsh@0.1.0-rc.6'
+const DSH_DEFAULT_VERSION = '0.1.0-rc.6'
+const DSH_PKG = `@deepseek-ai/dsh@${process.env.DSH_VERSION || DSH_DEFAULT_VERSION}`
 const ROOT = path.join(__dirname, '..')
 const RESOURCES = process.env.HARBOR_RESOURCES || path.join(ROOT, 'resources')
 const CACHE = process.env.HARBOR_CACHE || path.join(RESOURCES, 'cache')
@@ -320,6 +321,8 @@ async function buildArtifact() {
     entry,
     minimumDshedVersion: shellPkg.version,
     releasedAt: new Date().toISOString(),
+    releaseTag: `dsh-v${version}-${buildId}`,
+    channel: 'stable',
   }
 
   const manifestPath = path.join(outDir, 'dsh-runtime-manifest.json')
